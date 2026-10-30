@@ -2,7 +2,9 @@ package com.example.data
 
 import android.content.Context
 import android.media.MediaMetadataRetriever
+import android.media.MediaScannerConnection
 import android.os.Environment
+import android.util.Log
 import com.example.model.RecordedVideo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -17,22 +19,74 @@ class VideoRepository(private val context: Context) {
     val videos: StateFlow<List<RecordedVideo>> = _videos.asStateFlow()
 
     fun getRecordingsDir(): File {
-        // Primary directory: app external files directory for Movies
-        val dir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
-            ?: File(context.filesDir, "Movies")
-        if (!dir.exists()) {
-            dir.mkdirs()
+        // Preferred: public Movies/ScreenCraft directory so videos appear directly in Gallery and Files
+        val publicMovies = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
+        val screenCraftDir = File(publicMovies, "ScreenCraft")
+        if (!screenCraftDir.exists()) {
+            screenCraftDir.mkdirs()
         }
-        return dir
+        if (screenCraftDir.exists() && screenCraftDir.canWrite()) {
+            return screenCraftDir
+        }
+
+        // Fallback: app external files directory if public directory is not writable yet
+        val fallbackDir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
+            ?: File(context.filesDir, "Movies")
+        if (!fallbackDir.exists()) {
+            fallbackDir.mkdirs()
+        }
+        return fallbackDir
+    }
+
+    fun scanFileForGallery(file: File) {
+        if (file.exists() && file.length() > 0) {
+            MediaScannerConnection.scanFile(
+                context,
+                arrayOf(file.absolutePath),
+                arrayOf("video/mp4")
+            ) { path, uri ->
+                Log.d("VideoRepository", "Video scanned into MediaStore for Gallery: $path -> $uri")
+            }
+        }
+    }
+
+    private fun cleanupOrphanedTempFiles(dir: File) {
+        try {
+            dir.listFiles()?.forEach { file ->
+                if (file.isFile) {
+                    val isTemp = file.name.startsWith("temp_")
+                    val isZeroByte = file.length() == 0L
+                    val isAudioTemp = file.extension.lowercase() == "m4a" && file.name.startsWith("temp_")
+                    if (isTemp || isZeroByte || isAudioTemp) {
+                        file.delete()
+                    }
+                }
+            }
+        } catch (_: Exception) {}
     }
 
     suspend fun refreshVideos() = withContext(Dispatchers.IO) {
-        val dir = getRecordingsDir()
-        val files = dir.listFiles { file ->
-            file.isFile && file.extension.lowercase() == "mp4" && file.length() > 0
-        } ?: emptyArray()
+        val primaryDir = getRecordingsDir()
+        val fallbackDir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
 
-        val list = files.mapNotNull { file ->
+        cleanupOrphanedTempFiles(primaryDir)
+        if (fallbackDir != null && fallbackDir.exists() && fallbackDir != primaryDir) {
+            cleanupOrphanedTempFiles(fallbackDir)
+        }
+
+        val allFiles = mutableListOf<File>()
+        primaryDir.listFiles { file ->
+            file.isFile && file.extension.lowercase() == "mp4" && file.length() > 0 && !file.name.startsWith("temp_")
+        }?.let { allFiles.addAll(it) }
+
+        if (fallbackDir != null && fallbackDir.exists() && fallbackDir != primaryDir) {
+            fallbackDir.listFiles { file ->
+                file.isFile && file.extension.lowercase() == "mp4" && file.length() > 0 && !file.name.startsWith("temp_")
+            }?.let { allFiles.addAll(it) }
+        }
+
+        val list = allFiles.distinctBy { it.name }.mapNotNull { file ->
+            scanFileForGallery(file)
             extractVideoInfo(file)
         }.sortedByDescending { it.lastModified }
 
@@ -104,6 +158,7 @@ class VideoRepository(private val context: Context) {
             false
         }
         if (renamed) {
+            scanFileForGallery(targetFile)
             refreshVideos()
         }
         renamed

@@ -183,11 +183,12 @@ class ScreenRecorderService : Service() {
             val finalFile = File(recordingsDir, "ScreenCraft_$timeStamp.mp4")
             currentFinalOutputFile = finalFile
 
-            val isInternalAudio = settings.audioMode == AudioMode.INTERNAL_ONLY
-            val isMicAudio = settings.audioMode == AudioMode.INTERNAL_AND_MIC
+            // Dual-stream internal audio is exclusively supported on Android 10+ (API 29+)
+            val isAndroid10Plus = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+            val isInternalAudioDualStream = isAndroid10Plus && settings.audioMode == AudioMode.INTERNAL_ONLY
+            val shouldRecordAudio = settings.audioMode != AudioMode.MUTED
 
-            // If internal audio is used, we record video and internal audio separately then mux them losslessly
-            val videoTargetFile = if (isInternalAudio) {
+            val videoTargetFile = if (isInternalAudioDualStream) {
                 File(recordingsDir, "temp_video_$timeStamp.mp4")
             } else {
                 finalFile
@@ -202,13 +203,13 @@ class ScreenRecorderService : Service() {
             }
             mediaRecorder = recorder
 
-            // Audio configuration:
-            // NEVER use microphone if INTERNAL_ONLY or MUTED!
-            if (isMicAudio) {
+            // On Android 8/9, record audio directly in MediaRecorder when audio is enabled
+            val directAudio = shouldRecordAudio && !isInternalAudioDualStream
+            if (directAudio) {
                 try {
                     recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
                 } catch (e: Exception) {
-                    Log.w(TAG, "Mic audio source setup warning", e)
+                    Log.w(TAG, "Audio source setup warning", e)
                 }
             }
 
@@ -216,10 +217,14 @@ class ScreenRecorderService : Service() {
             recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
 
-            if (isMicAudio) {
-                recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                recorder.setAudioEncodingBitRate(192_000)
-                recorder.setAudioSamplingRate(48000)
+            if (directAudio) {
+                try {
+                    recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                    recorder.setAudioEncodingBitRate(192_000)
+                    recorder.setAudioSamplingRate(48000)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Audio encoder setup warning", e)
+                }
             }
 
             recorder.setVideoSize(width, height)
@@ -228,6 +233,9 @@ class ScreenRecorderService : Service() {
             recorder.setOutputFile(videoTargetFile.absolutePath)
 
             recorder.prepare()
+
+            // CRITICAL FOR ANDROID 8+: Start MediaRecorder FIRST before routing VirtualDisplay
+            recorder.start()
 
             val surface = recorder.surface
             virtualDisplay = projection.createVirtualDisplay(
@@ -241,22 +249,21 @@ class ScreenRecorderService : Service() {
                 null
             )
 
-            // Start pure internal audio capture if enabled
-            if (isInternalAudio) {
+            // Start pure internal audio capture on Android 10+ if dual-stream is requested
+            if (isInternalAudioDualStream) {
                 val audioFile = File(recordingsDir, "temp_audio_$timeStamp.m4a")
                 tempAudioFile = audioFile
                 val internalRecorder = InternalAudioCaptureRecorder(projection, audioFile)
                 val started = internalRecorder.start()
                 if (started) {
                     internalAudioRecorder = internalRecorder
-                    Log.d(TAG, "Started pure internal audio recorder (microphone hardware NOT used)")
+                    Log.d(TAG, "Started pure internal audio recorder (Android 10+ API)")
                 } else {
                     Log.w(TAG, "Internal audio capture could not start, continuing video")
                     tempAudioFile = null
                 }
             }
 
-            recorder.start()
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start screen recording", e)
@@ -296,25 +303,40 @@ class ScreenRecorderService : Service() {
     private fun stopRecording() {
         timerJob?.cancel()
         _recorderState.value = RecorderState(status = RecorderStatus.STOPPING)
-        updateNotification("Saving & Processing high-quality audio...")
+        updateNotification("Saving & Processing video...")
 
         serviceScope.launch(Dispatchers.IO) {
             val elapsed = _recorderState.value.elapsedSeconds
             if (elapsed == 0L) {
                 try {
-                    Thread.sleep(700)
+                    Thread.sleep(1000)
                 } catch (_: Exception) {}
             }
 
+            // 1. Release VirtualDisplay FIRST so no more surface frames push during shutdown
+            try {
+                virtualDisplay?.release()
+                virtualDisplay = null
+            } catch (e: Exception) {
+                Log.w(TAG, "VirtualDisplay release: ${e.message}")
+            }
+
+            // 2. Allow MPEG4Writer and encoder pipeline 350ms to complete pending frame buffers
+            try {
+                Thread.sleep(350)
+            } catch (_: Exception) {}
+
+            // 3. Stop MediaRecorder cleanly
             try {
                 mediaRecorder?.stop()
             } catch (e: Exception) {
-                Log.w(TAG, "MediaRecorder stop handled gracefully: ${e.message}")
+                Log.w(TAG, "MediaRecorder stop handled: ${e.message}")
             }
             try {
                 mediaRecorder?.reset()
             } catch (_: Exception) {}
 
+            // 4. Stop internal audio recorder if active
             try {
                 internalAudioRecorder?.stop()
                 internalAudioRecorder = null
@@ -330,17 +352,30 @@ class ScreenRecorderService : Service() {
             val audioFile = tempAudioFile
             val trimSeconds = currentSettings?.stopTrimSeconds ?: 0
 
-            if (finalTarget != null && videoFile != null && videoFile.exists()) {
-                if (audioFile != null && audioFile.exists()) {
-                    // Merge internal audio track with video track and apply end trim
+            if (finalTarget != null && videoFile != null && videoFile.exists() && videoFile.length() > 0) {
+                if (audioFile != null && audioFile.exists() && audioFile.length() > 0) {
                     VideoTrimmer.mergeAndTrim(videoFile, audioFile, finalTarget, trimSeconds)
                 } else if (trimSeconds > 0) {
                     VideoTrimmer.trimEnd(videoFile, trimSeconds, finalTarget)
                 } else if (videoFile != finalTarget) {
                     videoFile.renameTo(finalTarget)
                 }
-                VideoRepository.getInstance(applicationContext).refreshVideos()
+
+                // Register final file in Android MediaStore so it immediately appears in phone's Gallery
+                if (finalTarget.exists() && finalTarget.length() > 0) {
+                    VideoRepository.getInstance(applicationContext).scanFileForGallery(finalTarget)
+                }
+            } else {
+                // Delete orphaned 0-byte files if any
+                if (videoFile?.exists() == true && videoFile.length() == 0L) {
+                    videoFile.delete()
+                }
+                if (audioFile?.exists() == true) {
+                    audioFile.delete()
+                }
             }
+
+            VideoRepository.getInstance(applicationContext).refreshVideos()
 
             _recorderState.value = RecorderState(status = RecorderStatus.IDLE)
             stopForeground(STOP_FOREGROUND_REMOVE)

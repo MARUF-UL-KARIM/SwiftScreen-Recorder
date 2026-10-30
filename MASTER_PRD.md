@@ -143,3 +143,27 @@ On Android 8.1 / 9 devices:
 - **Permanent Latest Download Link:**
   `https://github.com/<USERNAME>/<REPOSITORY>/releases/latest/download/app-debug.apk`
 
+---
+
+## 8. Android 8.1+ Compatibility & System Gallery Integration
+
+### 8.1 Public Movies Directory & MediaStore Gallery Scanning
+- **Public Directory:** Recordings are written directly to `/storage/emulated/0/Movies/ScreenCraft/` (`Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)/ScreenCraft`).
+- **MediaStore Indexing:** As soon as an MP4 recording finishes or is renamed, `MediaScannerConnection.scanFile(...)` scans the file with mime type `"video/mp4"`. This triggers Android's system media provider to immediately register the video in the device's native **Gallery**, **Photos**, and file manager apps.
+- **Runtime Permissions on Android 8/9:** `WRITE_EXTERNAL_STORAGE` and `READ_EXTERNAL_STORAGE` are explicitly requested at runtime on API level <= 28 before initiating screen recording.
+
+### 8.2 MediaRecorder Start & Stop Lifecycle on Android 8
+- **Start Sequence:**
+  1. `recorder.prepare()`
+  2. `recorder.start()` is invoked **FIRST**.
+  3. `projection.createVirtualDisplay(...)` is called **AFTER** `recorder.start()`. This prevents premature surface buffer delivery to an unstarted MediaCodec/Stagefright encoder, eliminating native `MEDIA_RECORDER_ERROR` and 0-byte video crashes.
+- **Stop Sequence:**
+  1. `virtualDisplay?.release()` is invoked **FIRST** to stop pushing display frames.
+  2. A 350ms delay allows MPEG4Writer and encoder pipeline to finalize buffered packets.
+  3. `mediaRecorder?.stop()` is executed safely, properly finalizing the MP4 moov atom.
+- **Single-Stream Audio on Android 8/9:**
+  - Android 10+ uses `AudioPlaybackCaptureConfiguration` dual-stream.
+  - Android 8/9 devices lack `AudioPlaybackCaptureConfiguration`. Audio is routed directly via `MediaRecorder` (`setAudioSource(MediaRecorder.AudioSource.MIC)` + `setAudioEncoder(MediaRecorder.AudioEncoder.AAC)`), producing a single unified, hardware-synced MP4 file without separate orphan temporary files.
+- **Orphan Cleanup:** `VideoRepository` automatically purges 0-byte files or broken `temp_` artifacts on refresh.
+
+

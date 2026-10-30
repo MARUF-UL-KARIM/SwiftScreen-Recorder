@@ -112,6 +112,27 @@ class ScreenRecorderService : Service() {
         currentSettings = settings
         val delaySec = settings.startDelaySeconds
 
+        // Secure MediaProjection immediately upon receiving token
+        val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        val projection = projectionManager.getMediaProjection(resultCode, resultData)
+        if (projection == null) {
+            Log.e(TAG, "MediaProjection token invalid or expired")
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+        mediaProjection = projection
+
+        val callback = object : MediaProjection.Callback() {
+            override fun onStop() {
+                super.onStop()
+                Log.d(TAG, "MediaProjection stopped by system")
+                stopRecording()
+            }
+        }
+        projectionCallback = callback
+        projection.registerCallback(callback, Handler(Looper.getMainLooper()))
+
         timerJob?.cancel()
         timerJob = serviceScope.launch {
             if (delaySec > 0) {
@@ -125,8 +146,8 @@ class ScreenRecorderService : Service() {
                 }
             }
 
-            // Begin recording
-            val success = initAndStartRecorder(resultCode, resultData, settings)
+            // Begin recording using pre-validated projection
+            val success = initAndStartRecorder(projection, settings)
             if (success) {
                 var elapsedSec = 0L
                 _recorderState.value = RecorderState(
@@ -149,32 +170,19 @@ class ScreenRecorderService : Service() {
     }
 
     private fun initAndStartRecorder(
-        resultCode: Int,
-        resultData: Intent,
+        projection: MediaProjection,
         settings: RecordingSettings
     ): Boolean {
         return try {
-            val projectionManager =
-                getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            val projection = projectionManager.getMediaProjection(resultCode, resultData) ?: return false
-            mediaProjection = projection
-
-            val callback = object : MediaProjection.Callback() {
-                override fun onStop() {
-                    super.onStop()
-                    Log.d(TAG, "MediaProjection stopped by system")
-                    stopRecording()
-                }
-            }
-            projectionCallback = callback
-            projection.registerCallback(callback, Handler(Looper.getMainLooper()))
-
             val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
             val metrics = DisplayMetrics()
             @Suppress("DEPRECATION")
             windowManager.defaultDisplay.getRealMetrics(metrics)
 
-            val (width, height) = settings.resolution.getDimensions(metrics.widthPixels, metrics.heightPixels)
+            val (baseWidth, baseHeight) = settings.resolution.getDimensions(metrics.widthPixels, metrics.heightPixels)
+            val isPortrait = metrics.heightPixels >= metrics.widthPixels
+            val width = if (isPortrait) minOf(baseWidth, baseHeight) else maxOf(baseWidth, baseHeight)
+            val height = if (isPortrait) maxOf(baseWidth, baseHeight) else minOf(baseWidth, baseHeight)
             val dpi = metrics.densityDpi
 
             val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -183,12 +191,12 @@ class ScreenRecorderService : Service() {
             val finalFile = File(recordingsDir, "ScreenCraft_$timeStamp.mp4")
             currentFinalOutputFile = finalFile
 
-            // Dual-stream internal audio is exclusively supported on Android 10+ (API 29+)
-            val isAndroid10Plus = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
-            val isInternalAudioDualStream = isAndroid10Plus && settings.audioMode == AudioMode.INTERNAL_ONLY
-            val shouldRecordAudio = settings.audioMode != AudioMode.MUTED
+            val isInternalAudio = settings.audioMode == AudioMode.INTERNAL_ONLY
+            val isMicAudio = settings.audioMode == AudioMode.INTERNAL_AND_MIC
 
-            val videoTargetFile = if (isInternalAudioDualStream) {
+            // When INTERNAL_ONLY is requested: STRICTLY DO NOT TOUCH MICROPHONE!
+            // Video and internal audio are captured via dedicated pure digital pipeline
+            val videoTargetFile = if (isInternalAudio) {
                 File(recordingsDir, "temp_video_$timeStamp.mp4")
             } else {
                 finalFile
@@ -203,13 +211,12 @@ class ScreenRecorderService : Service() {
             }
             mediaRecorder = recorder
 
-            // On Android 8/9, record audio directly in MediaRecorder when audio is enabled
-            val directAudio = shouldRecordAudio && !isInternalAudioDualStream
-            if (directAudio) {
+            // ONLY engage microphone if the user explicitly chose INTERNAL_AND_MIC
+            if (isMicAudio) {
                 try {
                     recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
                 } catch (e: Exception) {
-                    Log.w(TAG, "Audio source setup warning", e)
+                    Log.w(TAG, "Microphone audio source warning", e)
                 }
             }
 
@@ -217,7 +224,7 @@ class ScreenRecorderService : Service() {
             recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
 
-            if (directAudio) {
+            if (isMicAudio) {
                 try {
                     recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
                     recorder.setAudioEncodingBitRate(192_000)
@@ -234,10 +241,10 @@ class ScreenRecorderService : Service() {
 
             recorder.prepare()
 
-            // CRITICAL FOR ANDROID 8+: Start MediaRecorder FIRST before routing VirtualDisplay
-            recorder.start()
-
+            // 1. Surface MUST be retrieved after prepare() and BEFORE start()
             val surface = recorder.surface
+
+            // 2. Create VirtualDisplay attached to the prepared surface
             virtualDisplay = projection.createVirtualDisplay(
                 "ScreenCraftDisplay",
                 width,
@@ -249,21 +256,23 @@ class ScreenRecorderService : Service() {
                 null
             )
 
-            // Start pure internal audio capture on Android 10+ if dual-stream is requested
-            if (isInternalAudioDualStream) {
+            // 3. Start pure digital internal audio capture (ZERO microphone hardware)
+            if (isInternalAudio) {
                 val audioFile = File(recordingsDir, "temp_audio_$timeStamp.m4a")
                 tempAudioFile = audioFile
                 val internalRecorder = InternalAudioCaptureRecorder(projection, audioFile)
                 val started = internalRecorder.start()
                 if (started) {
                     internalAudioRecorder = internalRecorder
-                    Log.d(TAG, "Started pure internal audio recorder (Android 10+ API)")
+                    Log.d(TAG, "Started pure internal digital audio recorder (No microphone used)")
                 } else {
-                    Log.w(TAG, "Internal audio capture could not start, continuing video")
+                    Log.w(TAG, "Pure internal audio not available on this ROM; recording video cleanly without microphone")
                     tempAudioFile = null
                 }
             }
 
+            // 4. Start MediaRecorder
+            recorder.start()
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start screen recording", e)

@@ -153,17 +153,23 @@ On Android 8.1 / 9 devices:
 - **Runtime Permissions on Android 8/9:** `WRITE_EXTERNAL_STORAGE` and `READ_EXTERNAL_STORAGE` are explicitly requested at runtime on API level <= 28 before initiating screen recording.
 
 ### 8.2 MediaRecorder Start & Stop Lifecycle on Android 8
-- **Start Sequence:**
+- **Surface Lifecycle Rule:**
   1. `recorder.prepare()`
-  2. `recorder.start()` is invoked **FIRST**.
-  3. `projection.createVirtualDisplay(...)` is called **AFTER** `recorder.start()`. This prevents premature surface buffer delivery to an unstarted MediaCodec/Stagefright encoder, eliminating native `MEDIA_RECORDER_ERROR` and 0-byte video crashes.
+  2. `val surface = recorder.surface` is retrieved **immediately after prepare() and BEFORE start()** (avoiding native `IllegalStateException`).
+  3. `projection.createVirtualDisplay(...)` is created using the prepared surface.
+  4. Pure digital audio capture is started (if enabled).
+  5. `recorder.start()` is invoked to begin recording.
 - **Stop Sequence:**
   1. `virtualDisplay?.release()` is invoked **FIRST** to stop pushing display frames.
   2. A 350ms delay allows MPEG4Writer and encoder pipeline to finalize buffered packets.
   3. `mediaRecorder?.stop()` is executed safely, properly finalizing the MP4 moov atom.
-- **Single-Stream Audio on Android 8/9:**
-  - Android 10+ uses `AudioPlaybackCaptureConfiguration` dual-stream.
-  - Android 8/9 devices lack `AudioPlaybackCaptureConfiguration`. Audio is routed directly via `MediaRecorder` (`setAudioSource(MediaRecorder.AudioSource.MIC)` + `setAudioEncoder(MediaRecorder.AudioEncoder.AAC)`), producing a single unified, hardware-synced MP4 file without separate orphan temporary files.
-- **Orphan Cleanup:** `VideoRepository` automatically purges 0-byte files or broken `temp_` artifacts on refresh.
+
+### 8.3 Strict Zero-Microphone Rule for Internal Audio
+- When **Internal Audio Only** (`AudioMode.INTERNAL_ONLY`) is selected:
+  - The device microphone hardware is **STRICTLY NEVER OPENED**. Under no circumstance is `AudioSource.MIC` configured.
+  - On Android 10+ (API 29+): `AudioPlaybackCaptureConfiguration` captures digital internal audio without microphone.
+  - On Android 8.1 / 9 (API 27/28): `AudioSource.REMOTE_SUBMIX` (Source 8) directly captures digital internal audio loopback without physical microphone hardware. If not supported by the OEM ROM, no audio is captured, ensuring ambient room noise or speech is never recorded.
+- The microphone is only enabled if the user explicitly selects **Internal + Microphone** (`AudioMode.INTERNAL_AND_MIC`).
+
 
 

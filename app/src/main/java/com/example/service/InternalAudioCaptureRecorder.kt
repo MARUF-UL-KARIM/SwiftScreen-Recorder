@@ -121,60 +121,20 @@ class InternalAudioCaptureRecorder(
 
     @SuppressLint("MissingPermission")
     private fun createAudioRecordForAndroid8(bufferSize: Int): AudioRecord? {
-        // 1. Try REMOTE_SUBMIX (Source 8) - direct internal loopback submix
+        // Direct digital internal loopback submix (Source 8) - strictly no microphone hardware
         try {
             val rec = AudioRecord(8, SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT, bufferSize)
             if (rec.state == AudioRecord.STATE_INITIALIZED) {
-                Log.d(TAG, "Android 8.1: Using AudioSource.REMOTE_SUBMIX (Direct Internal)")
+                Log.d(TAG, "Android 8.1: Using AudioSource.REMOTE_SUBMIX (Pure Digital Internal Audio)")
                 isDirectInternalSubmix = true
                 return rec
             }
             rec.release()
         } catch (e: Exception) {
-            Log.w(TAG, "Android 8.1: REMOTE_SUBMIX not permitted on this ROM: ${e.message}")
+            Log.w(TAG, "Android 8.1: REMOTE_SUBMIX not permitted by ROM: ${e.message}")
         }
 
-        // 2. Try UNPROCESSED (Source 9) - raw hardware capture without AGC room boost
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            try {
-                val rec = AudioRecord(MediaRecorder.AudioSource.UNPROCESSED, SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT, bufferSize)
-                if (rec.state == AudioRecord.STATE_INITIALIZED) {
-                    Log.d(TAG, "Android 8.1: Using AudioSource.UNPROCESSED with Acoustic Isolation Filter")
-                    isDirectInternalSubmix = false
-                    return rec
-                }
-                rec.release()
-            } catch (e: Exception) {
-                Log.w(TAG, "Android 8.1: UNPROCESSED not supported: ${e.message}")
-            }
-        }
-
-        // 3. Try VOICE_RECOGNITION (Source 6)
-        try {
-            val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT, bufferSize)
-            if (rec.state == AudioRecord.STATE_INITIALIZED) {
-                Log.d(TAG, "Android 8.1: Using AudioSource.VOICE_RECOGNITION with Acoustic Isolation Filter")
-                isDirectInternalSubmix = false
-                return rec
-            }
-            rec.release()
-        } catch (e: Exception) {
-            Log.w(TAG, "Android 8.1: VOICE_RECOGNITION failed: ${e.message}")
-        }
-
-        // 4. Try DEFAULT (Source 0)
-        try {
-            val rec = AudioRecord(MediaRecorder.AudioSource.DEFAULT, SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT, bufferSize)
-            if (rec.state == AudioRecord.STATE_INITIALIZED) {
-                Log.d(TAG, "Android 8.1: Using AudioSource.DEFAULT with Acoustic Isolation Filter")
-                isDirectInternalSubmix = false
-                return rec
-            }
-            rec.release()
-        } catch (e: Exception) {
-            Log.w(TAG, "Android 8.1: DEFAULT audio source failed: ${e.message}")
-        }
-
+        // As instructed, NEVER fall back to physical microphone or acoustic room capture
         return null
     }
 

@@ -140,6 +140,14 @@ class VideoRepository(private val context: Context) {
             false
         }
         if (deleted) {
+            try {
+                MediaScannerConnection.scanFile(
+                    context,
+                    arrayOf(video.file.absolutePath),
+                    null,
+                    null
+                )
+            } catch (_: Exception) {}
             refreshVideos()
         }
         deleted

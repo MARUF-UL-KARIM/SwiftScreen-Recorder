@@ -92,59 +92,56 @@ object VideoTrimmer {
             val buffer = ByteBuffer.allocate(DEFAULT_BUFFER_SIZE)
             val bufferInfo = MediaCodec.BufferInfo()
 
-            // 1. Write Video Samples
             var videoSamplesWritten = 0
-            if (videoTrackOut >= 0) {
-                while (true) {
-                    val trackIndex = videoExtractor.sampleTrackIndex
-                    if (trackIndex < 0) break
-
-                    val sampleTime = videoExtractor.sampleTime
-                    if (sampleTime > targetEndUs) {
-                        videoExtractor.advance()
-                        continue
-                    }
-
-                    buffer.clear()
-                    val sampleSize = videoExtractor.readSampleData(buffer, 0)
-                    if (sampleSize < 0) break
-
-                    bufferInfo.offset = 0
-                    bufferInfo.size = sampleSize
-                    bufferInfo.presentationTimeUs = sampleTime
-                    bufferInfo.flags = videoExtractor.sampleFlags
-
-                    muxer.writeSampleData(videoTrackOut, buffer, bufferInfo)
-                    videoSamplesWritten++
-                    videoExtractor.advance()
-                }
-            }
-
-            // 2. Write Audio Samples (High-Quality Internal Audio)
             var audioSamplesWritten = 0
-            if (audioTrackOut >= 0) {
-                while (true) {
-                    val trackIndex = audioExtractor.sampleTrackIndex
-                    if (trackIndex < 0) break
 
-                    val sampleTime = audioExtractor.sampleTime
-                    if (sampleTime > targetEndUs) {
-                        audioExtractor.advance()
-                        continue
+            var videoDone = (videoTrackIn < 0 || videoTrackOut < 0)
+            var audioDone = (audioTrackIn < 0 || audioTrackOut < 0)
+
+            // Interleaved processing: Feed samples chronologically by timestamp
+            // Prevents native MediaMuxer buffer overfill on Android 8.1
+            while (!videoDone || !audioDone) {
+                val vTime = if (!videoDone) videoExtractor.sampleTime else Long.MAX_VALUE
+                val aTime = if (!audioDone) audioExtractor.sampleTime else Long.MAX_VALUE
+
+                if (vTime == -1L && aTime == -1L) break
+
+                if (!videoDone && (audioDone || (vTime != -1L && vTime <= aTime))) {
+                    if (vTime > targetEndUs) {
+                        videoDone = true
+                    } else {
+                        buffer.clear()
+                        val sampleSize = videoExtractor.readSampleData(buffer, 0)
+                        if (sampleSize < 0) {
+                            videoDone = true
+                        } else {
+                            bufferInfo.offset = 0
+                            bufferInfo.size = sampleSize
+                            bufferInfo.presentationTimeUs = vTime
+                            bufferInfo.flags = videoExtractor.sampleFlags
+                            muxer.writeSampleData(videoTrackOut, buffer, bufferInfo)
+                            videoSamplesWritten++
+                            videoExtractor.advance()
+                        }
                     }
-
-                    buffer.clear()
-                    val sampleSize = audioExtractor.readSampleData(buffer, 0)
-                    if (sampleSize < 0) break
-
-                    bufferInfo.offset = 0
-                    bufferInfo.size = sampleSize
-                    bufferInfo.presentationTimeUs = sampleTime
-                    bufferInfo.flags = audioExtractor.sampleFlags
-
-                    muxer.writeSampleData(audioTrackOut, buffer, bufferInfo)
-                    audioSamplesWritten++
-                    audioExtractor.advance()
+                } else if (!audioDone) {
+                    if (aTime > targetEndUs) {
+                        audioDone = true
+                    } else {
+                        buffer.clear()
+                        val sampleSize = audioExtractor.readSampleData(buffer, 0)
+                        if (sampleSize < 0) {
+                            audioDone = true
+                        } else {
+                            bufferInfo.offset = 0
+                            bufferInfo.size = sampleSize
+                            bufferInfo.presentationTimeUs = aTime
+                            bufferInfo.flags = audioExtractor.sampleFlags
+                            muxer.writeSampleData(audioTrackOut, buffer, bufferInfo)
+                            audioSamplesWritten++
+                            audioExtractor.advance()
+                        }
+                    }
                 }
             }
 
@@ -173,6 +170,10 @@ object VideoTrimmer {
             try { videoExtractor.release() } catch (_: Exception) {}
             try { audioExtractor.release() } catch (_: Exception) {}
 
+            // Critical fix: Delete partially written or corrupt outputFile before renaming videoFile
+            if (outputFile.exists() && outputFile != videoFile) {
+                outputFile.delete()
+            }
             if (videoFile.exists()) {
                 videoFile.renameTo(outputFile)
             }
@@ -189,6 +190,7 @@ object VideoTrimmer {
     fun trimEnd(sourceFile: File, trimSeconds: Int, destinationFile: File? = null): File {
         if (!sourceFile.exists() || trimSeconds <= 0) {
             if (destinationFile != null && destinationFile != sourceFile) {
+                if (destinationFile.exists()) destinationFile.delete()
                 sourceFile.renameTo(destinationFile)
                 return destinationFile
             }

@@ -303,42 +303,42 @@ private fun RecordedVideoItemCard(
                 IconButton(
                     onClick = onShare,
                     modifier = Modifier
-                        .size(36.dp)
+                        .size(40.dp)
                         .testTag("share_video_${video.name}")
                 ) {
                     Icon(
                         imageVector = Icons.Default.Share,
                         contentDescription = "Share",
                         tint = StudioBlue,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                 }
 
                 IconButton(
                     onClick = onRename,
                     modifier = Modifier
-                        .size(36.dp)
+                        .size(40.dp)
                         .testTag("rename_video_${video.name}")
                 ) {
                     Icon(
                         imageVector = Icons.Default.DriveFileRenameOutline,
                         contentDescription = "Rename",
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                 }
 
                 IconButton(
                     onClick = onDelete,
                     modifier = Modifier
-                        .size(36.dp)
+                        .size(40.dp)
                         .testTag("delete_video_${video.name}")
                 ) {
                     Icon(
                         imageVector = Icons.Default.Delete,
                         contentDescription = "Delete",
                         tint = StudioRed,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                 }
             }

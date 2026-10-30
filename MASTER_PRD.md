@@ -171,5 +171,43 @@ On Android 8.1 / 9 devices:
   - On Android 8.1 / 9 (API 27/28): `AudioSource.REMOTE_SUBMIX` (Source 8) directly captures digital internal audio loopback without physical microphone hardware. If not supported by the OEM ROM, no audio is captured, ensuring ambient room noise or speech is never recorded.
 - The microphone is only enabled if the user explicitly selects **Internal + Microphone** (`AudioMode.INTERNAL_AND_MIC`).
 
+### 8.4 MainActivity MediaProjectionManager & Compose State Management
+- **MainActivity Capture Initiation:** `MainActivity` configures `projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager` and implements `registerForActivityResult(ActivityResultContracts.StartActivityForResult())`.
+  - Verifies `WRITE_EXTERNAL_STORAGE` and `READ_EXTERNAL_STORAGE` for API 26/27 before triggering the permission prompt.
+  - Launches `ScreenRecorderService` with `ACTION_START`, `EXTRA_RESULT_CODE`, and `EXTRA_RESULT_DATA`.
+- **Exact VirtualDisplay Dimensions:** Configured strictly to **720x1520** (or 1520x720 in landscape) matching the physical screen bounds.
+- **Output File Initialization:** The target `File` object is guaranteed to exist with `createNewFile()` and parent directory verification before passing `absolutePath` to `MediaRecorder.setOutputFile(...)`.
+- **Floating Notification & UI Indicator:** When recording is active, a floating persistent pill banner appears at the top of the Compose UI showing a live recording dot, formatted timer, and a direct action button with text **'Stop Recording'**.
+- **Hero Card Button Text:** All active session buttons are updated to display **'Stop Recording'**.
 
+---
 
+## 9. Comprehensive Bug Fixes & Resiliency Hardening (v1.2.0)
+
+### 9.1 Audio Timestamp Generation & Drift Elimination
+- **Issue:** `InternalAudioCaptureRecorder` originally fed `System.nanoTime() / 1000` into `MediaCodec`. This produced absolute uptime timestamps in the hundreds of billions of microseconds, while the video stream timestamps started at 0. During `VideoTrimmer.mergeAndTrim(...)`, `audioExtractor.sampleTime > targetEndUs` evaluated to `true` immediately, discarding every audio sample and producing silent or desynchronized video.
+- **Resolution:** Presentation timestamps are now derived mathematically from total PCM bytes read:
+  `presentationTimeUs = (totalPcmBytesRead * 1_000_000L) / (SAMPLE_RATE * 4L)` (16-bit Stereo PCM = 4 bytes per frame).
+  Timestamps start precisely at `0 µs` and advance monotonically without drift or jitter.
+
+### 9.2 Interleaved Video & Audio Stream Multiplexing
+- **Issue:** Sequential writing of video samples followed by audio samples caused Android 8.1 native `MediaMuxer` buffer overflows when recordings were longer than a few seconds.
+- **Resolution:** Replaced sequential loops with an interleaved loop that compares `vTime <= aTime`, advancing chronologically. This ensures `MediaMuxer` receives data in balanced chunks without overfilling native buffers.
+
+### 9.3 Atomic File Rename Fallback on Linux/Android
+- **Issue:** On Linux/Android filesystems, `File.renameTo(target)` fails silently if `target` already exists. If `MediaMuxer` created a partial `outputFile` before an exception occurred, the fallback `videoFile.renameTo(outputFile)` failed, leaving a 0-byte corrupt file.
+- **Resolution:** Added explicit `if (outputFile.exists() && outputFile != videoFile) outputFile.delete()` before `renameTo` across both `mergeAndTrim` and `trimEnd`.
+
+### 9.4 Quick Settings Storage Permission Gate on Android 8.1 / 9
+- **Issue:** When starting a recording directly from the Quick Settings Tile on Android 8.1/9, `ScreenCapturePermissionActivity` only requested `MediaProjection` permissions without ensuring `WRITE_EXTERNAL_STORAGE` was granted, resulting in `FileNotFoundException (Permission denied)` when attempting to write to public Movies.
+- **Resolution:** `ScreenCapturePermissionActivity` now checks `WRITE_EXTERNAL_STORAGE` and `READ_EXTERNAL_STORAGE` at runtime on API <= 28, prompting the user if needed before launching `MediaProjection`. Also protected against duplicate launches via `savedInstanceState == null`.
+
+### 9.5 Gallery Database Cleanup on Deletion
+- **Issue:** Deleting a recorded video with `file.delete()` removed the file from disk, but Android's `MediaStore` database retained the metadata entry, showing a broken/unplayable ghost thumbnail in the phone's Gallery app.
+- **Resolution:** `VideoRepository.deleteVideo()` now invokes `MediaScannerConnection.scanFile(...)` on the deleted path, instructing the Android system scanner to immediately purge the record from the Gallery database.
+
+### 9.6 Screen Calibration for 720×1520 & UI Touch Accessibility
+- **Video Player Dialog:** Constrained height using `heightIn(min = 180.dp, max = 340.dp)` with dynamic aspect ratio calculation so that portrait 720×1520 and landscape videos never exceed screen height or push dialog buttons off screen.
+- **Stop Trim Chips:** Formatted labels to `"Off"`, `"1s"`, `"2s"`, `"3s"`, `"5s"` to guarantee seamless fit across 720px wide viewports without horizontal text wrapping.
+- **Touch Targets:** Adjusted action buttons (`Share`, `Rename`, `Delete`) to `40.dp` with expanded padding complying with Android Accessibility guidelines.
+- **FileProvider Paths:** Added `<external-path name="external_root" path="." />` ensuring broad coverage for all external storage sharing operations.

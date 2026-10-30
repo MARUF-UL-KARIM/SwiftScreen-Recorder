@@ -148,6 +148,8 @@ class InternalAudioCaptureRecorder(
         var muxerStarted = false
 
         try {
+            var totalPcmBytesRead = 0L
+
             while (isRecording) {
                 val readBytes = record.read(pcmBuffer, 0, pcmBuffer.size)
                 if (readBytes > 0) {
@@ -156,14 +158,16 @@ class InternalAudioCaptureRecorder(
                         applyAcousticNoiseGate(pcmBuffer, readBytes)
                     }
 
-                    // Feed raw PCM internal audio into AAC encoder
+                    // Feed raw PCM internal audio into AAC encoder with synchronized timestamps starting at 0
                     val inputIndex = codec.dequeueInputBuffer(10000)
                     if (inputIndex >= 0) {
                         val inputBuffer = codec.getInputBuffer(inputIndex)
                         inputBuffer?.clear()
                         inputBuffer?.put(pcmBuffer, 0, readBytes)
-                        val presentationTimeNs = System.nanoTime() / 1000
-                        codec.queueInputBuffer(inputIndex, 0, readBytes, presentationTimeNs, 0)
+                        // 16-bit Stereo PCM: 2 bytes * 2 channels = 4 bytes per frame
+                        val presentationTimeUs = (totalPcmBytesRead * 1_000_000L) / (SAMPLE_RATE * 4L)
+                        totalPcmBytesRead += readBytes
+                        codec.queueInputBuffer(inputIndex, 0, readBytes, presentationTimeUs, 0)
                     }
                 }
 
@@ -194,10 +198,11 @@ class InternalAudioCaptureRecorder(
                 }
             }
 
-            // Signal End of Stream
+            // Signal End of Stream with exact final timestamp
             val eosIndex = codec.dequeueInputBuffer(10000)
             if (eosIndex >= 0) {
-                codec.queueInputBuffer(eosIndex, 0, 0, System.nanoTime() / 1000, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                val eosTimeUs = (totalPcmBytesRead * 1_000_000L) / (SAMPLE_RATE * 4L)
+                codec.queueInputBuffer(eosIndex, 0, 0, eosTimeUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
             }
 
             // Drain remaining EOS output

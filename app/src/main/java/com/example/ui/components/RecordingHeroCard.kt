@@ -314,7 +314,7 @@ fun RecordingHeroCard(
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Stop & Save")
+                        Text("Stop Recording")
                     }
                 }
             } else if (isCountdown) {

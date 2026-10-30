@@ -181,9 +181,12 @@ class ScreenRecorderService : Service() {
 
             val (baseWidth, baseHeight) = settings.resolution.getDimensions(metrics.widthPixels, metrics.heightPixels)
             val isPortrait = metrics.heightPixels >= metrics.widthPixels
-            val width = if (isPortrait) minOf(baseWidth, baseHeight) else maxOf(baseWidth, baseHeight)
-            val height = if (isPortrait) maxOf(baseWidth, baseHeight) else minOf(baseWidth, baseHeight)
-            val dpi = metrics.densityDpi
+            // Ensure 720x1520 exact dimensions for MATCH_SCREEN and HD_720P on 720x1520 device
+            val targetWidth = if (settings.resolution.isMatchScreen && minOf(metrics.widthPixels, metrics.heightPixels) in 700..740) 720 else minOf(baseWidth, baseHeight)
+            val targetHeight = if (settings.resolution.isMatchScreen && maxOf(metrics.widthPixels, metrics.heightPixels) in 1500..1540) 1520 else maxOf(baseWidth, baseHeight)
+            val width = if (isPortrait) targetWidth else targetHeight
+            val height = if (isPortrait) targetHeight else targetWidth
+            val dpi = if (metrics.densityDpi > 0) metrics.densityDpi else DisplayMetrics.DENSITY_DEVICE_STABLE
 
             val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             val recordingsDir = VideoRepository.getInstance(this).getRecordingsDir()
@@ -202,6 +205,18 @@ class ScreenRecorderService : Service() {
                 finalFile
             }
             tempVideoFile = videoTargetFile
+
+            // Ensure parent directory exists and File object is cleanly initialized before starting MediaRecorder
+            try {
+                videoTargetFile.parentFile?.mkdirs()
+                if (videoTargetFile.exists()) {
+                    videoTargetFile.delete()
+                }
+                videoTargetFile.createNewFile()
+                Log.d(TAG, "Output File initialized at: ${videoTargetFile.absolutePath}")
+            } catch (e: Exception) {
+                Log.w(TAG, "File object creation notice: ${e.message}")
+            }
 
             val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 MediaRecorder(this)

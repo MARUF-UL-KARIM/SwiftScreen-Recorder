@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -121,11 +122,18 @@ fun VideoPlayerDialog(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
-                // Video Surface View
+                // Video Surface View (calibrated for 720×1520 and all aspect ratios)
+                val videoRatio = if (video.width > 0 && video.height > 0) {
+                    (video.width.toFloat() / video.height.toFloat()).coerceIn(0.45f, 2.2f)
+                } else {
+                    9f / 16f
+                }
+
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .aspectRatio(9f / 16f)
+                        .heightIn(min = 180.dp, max = 340.dp)
+                        .aspectRatio(videoRatio, matchHeightConstraintsFirst = true)
                         .clip(RoundedCornerShape(12.dp))
                         .background(Color.Black),
                     contentAlignment = Alignment.Center

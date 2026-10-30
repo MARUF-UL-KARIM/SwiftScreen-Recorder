@@ -343,9 +343,9 @@ fun SettingsScreen(
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        listOf(0 to "0s (Off)", 1 to "1 sec", 2 to "2 sec", 3 to "3 sec", 5 to "5 sec").forEach { (sec, label) ->
+                        listOf(0 to "Off", 1 to "1s", 2 to "2s", 3 to "3s", 5 to "5s").forEach { (sec, label) ->
                             SelectableChip(
                                 text = label,
                                 isSelected = settings.stopTrimSeconds == sec,

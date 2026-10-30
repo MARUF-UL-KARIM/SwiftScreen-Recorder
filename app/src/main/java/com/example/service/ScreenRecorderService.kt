@@ -1,0 +1,465 @@
+package com.example.service
+
+import android.app.Notification
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.MediaRecorder
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.util.DisplayMetrics
+import android.util.Log
+import android.view.WindowManager
+import androidx.core.app.NotificationCompat
+import com.example.MainActivity
+import com.example.R
+import com.example.ScreenCraftApp
+import com.example.data.SettingsRepository
+import com.example.data.VideoRepository
+import com.example.model.AudioMode
+import com.example.model.RecordingSettings
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class ScreenRecorderService : Service() {
+
+    private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
+    private var timerJob: Job? = null
+
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var mediaRecorder: MediaRecorder? = null
+    private var internalAudioRecorder: InternalAudioCaptureRecorder? = null
+    private var projectionCallback: MediaProjection.Callback? = null
+
+    private var currentFinalOutputFile: File? = null
+    private var tempVideoFile: File? = null
+    private var tempAudioFile: File? = null
+    private var currentSettings: RecordingSettings? = null
+    private var isPaused = false
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val action = intent?.action ?: return START_NOT_STICKY
+
+        when (action) {
+            ACTION_START -> {
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
+                val resultData = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(EXTRA_RESULT_DATA)
+                }
+
+                if (resultCode != 0 && resultData != null) {
+                    cachedResultCode = resultCode
+                    cachedResultData = resultData
+                    startForegroundServiceWithNotification("Preparing...")
+                    startCountdownAndRecording(resultCode, resultData)
+                }
+            }
+            ACTION_STOP -> {
+                stopRecording()
+            }
+            ACTION_PAUSE -> {
+                pauseRecording()
+            }
+            ACTION_RESUME -> {
+                resumeRecording()
+            }
+        }
+
+        return START_NOT_STICKY
+    }
+
+    private fun startForegroundServiceWithNotification(content: String) {
+        val notification = buildNotification(content)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                ScreenCraftApp.NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            )
+        } else {
+            startForeground(ScreenCraftApp.NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun startCountdownAndRecording(resultCode: Int, resultData: Intent) {
+        val settings = SettingsRepository.getInstance(this).settings.value
+        currentSettings = settings
+        val delaySec = settings.startDelaySeconds
+
+        timerJob?.cancel()
+        timerJob = serviceScope.launch {
+            if (delaySec > 0) {
+                for (remaining in delaySec downTo 1) {
+                    _recorderState.value = RecorderState(
+                        status = RecorderStatus.COUNTDOWN,
+                        countdownSeconds = remaining
+                    )
+                    updateNotification("Starting in ${remaining}s...")
+                    delay(1000)
+                }
+            }
+
+            // Begin recording
+            val success = initAndStartRecorder(resultCode, resultData, settings)
+            if (success) {
+                var elapsedSec = 0L
+                _recorderState.value = RecorderState(
+                    status = RecorderStatus.RECORDING,
+                    elapsedSeconds = elapsedSec
+                )
+                while (isActive) {
+                    delay(1000)
+                    if (!isPaused) {
+                        elapsedSec++
+                        _recorderState.value = _recorderState.value.copy(elapsedSeconds = elapsedSec)
+                        val formatted = formatSeconds(elapsedSec)
+                        updateNotification("Recording • $formatted")
+                    }
+                }
+            } else {
+                stopSelf()
+            }
+        }
+    }
+
+    private fun initAndStartRecorder(
+        resultCode: Int,
+        resultData: Intent,
+        settings: RecordingSettings
+    ): Boolean {
+        return try {
+            val projectionManager =
+                getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val projection = projectionManager.getMediaProjection(resultCode, resultData) ?: return false
+            mediaProjection = projection
+
+            val callback = object : MediaProjection.Callback() {
+                override fun onStop() {
+                    super.onStop()
+                    Log.d(TAG, "MediaProjection stopped by system")
+                    stopRecording()
+                }
+            }
+            projectionCallback = callback
+            projection.registerCallback(callback, Handler(Looper.getMainLooper()))
+
+            val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getRealMetrics(metrics)
+
+            val (width, height) = settings.resolution.getDimensions(metrics.widthPixels, metrics.heightPixels)
+            val dpi = metrics.densityDpi
+
+            val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val recordingsDir = VideoRepository.getInstance(this).getRecordingsDir()
+
+            val finalFile = File(recordingsDir, "ScreenCraft_$timeStamp.mp4")
+            currentFinalOutputFile = finalFile
+
+            val isInternalAudio = settings.audioMode == AudioMode.INTERNAL_ONLY
+            val isMicAudio = settings.audioMode == AudioMode.INTERNAL_AND_MIC
+
+            // If internal audio is used, we record video and internal audio separately then mux them losslessly
+            val videoTargetFile = if (isInternalAudio) {
+                File(recordingsDir, "temp_video_$timeStamp.mp4")
+            } else {
+                finalFile
+            }
+            tempVideoFile = videoTargetFile
+
+            val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                MediaRecorder(this)
+            } else {
+                @Suppress("DEPRECATION")
+                MediaRecorder()
+            }
+            mediaRecorder = recorder
+
+            // Audio configuration:
+            // NEVER use microphone if INTERNAL_ONLY or MUTED!
+            if (isMicAudio) {
+                try {
+                    recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Mic audio source setup warning", e)
+                }
+            }
+
+            recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+
+            if (isMicAudio) {
+                recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                recorder.setAudioEncodingBitRate(192_000)
+                recorder.setAudioSamplingRate(48000)
+            }
+
+            recorder.setVideoSize(width, height)
+            recorder.setVideoFrameRate(settings.fps)
+            recorder.setVideoEncodingBitRate(settings.bitrateMbps * 1000 * 1000)
+            recorder.setOutputFile(videoTargetFile.absolutePath)
+
+            recorder.prepare()
+
+            val surface = recorder.surface
+            virtualDisplay = projection.createVirtualDisplay(
+                "ScreenCraftDisplay",
+                width,
+                height,
+                dpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                surface,
+                null,
+                null
+            )
+
+            // Start pure internal audio capture if enabled
+            if (isInternalAudio) {
+                val audioFile = File(recordingsDir, "temp_audio_$timeStamp.m4a")
+                tempAudioFile = audioFile
+                val internalRecorder = InternalAudioCaptureRecorder(projection, audioFile)
+                val started = internalRecorder.start()
+                if (started) {
+                    internalAudioRecorder = internalRecorder
+                    Log.d(TAG, "Started pure internal audio recorder (microphone hardware NOT used)")
+                } else {
+                    Log.w(TAG, "Internal audio capture could not start, continuing video")
+                    tempAudioFile = null
+                }
+            }
+
+            recorder.start()
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start screen recording", e)
+            cleanup()
+            _recorderState.value = RecorderState(status = RecorderStatus.IDLE)
+            false
+        }
+    }
+
+    private fun pauseRecording() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && !isPaused) {
+            try {
+                mediaRecorder?.pause()
+                isPaused = true
+                _recorderState.value = _recorderState.value.copy(status = RecorderStatus.PAUSED)
+                updateNotification("Recording Paused")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to pause recording", e)
+            }
+        }
+    }
+
+    private fun resumeRecording() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isPaused) {
+            try {
+                mediaRecorder?.resume()
+                isPaused = false
+                _recorderState.value = _recorderState.value.copy(status = RecorderStatus.RECORDING)
+                val formatted = formatSeconds(_recorderState.value.elapsedSeconds)
+                updateNotification("Recording • $formatted")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to resume recording", e)
+            }
+        }
+    }
+
+    private fun stopRecording() {
+        timerJob?.cancel()
+        _recorderState.value = RecorderState(status = RecorderStatus.STOPPING)
+        updateNotification("Saving & Processing high-quality audio...")
+
+        serviceScope.launch(Dispatchers.IO) {
+            val elapsed = _recorderState.value.elapsedSeconds
+            if (elapsed == 0L) {
+                try {
+                    Thread.sleep(700)
+                } catch (_: Exception) {}
+            }
+
+            try {
+                mediaRecorder?.stop()
+            } catch (e: Exception) {
+                Log.w(TAG, "MediaRecorder stop handled gracefully: ${e.message}")
+            }
+            try {
+                mediaRecorder?.reset()
+            } catch (_: Exception) {}
+
+            try {
+                internalAudioRecorder?.stop()
+                internalAudioRecorder = null
+            } catch (e: Exception) {
+                Log.e(TAG, "Error stopping internal audio recorder", e)
+            } finally {
+                cleanup()
+            }
+
+            // Post-Processing: Lossless Video and Internal Audio Muxing + Stop Trimming
+            val finalTarget = currentFinalOutputFile
+            val videoFile = tempVideoFile
+            val audioFile = tempAudioFile
+            val trimSeconds = currentSettings?.stopTrimSeconds ?: 0
+
+            if (finalTarget != null && videoFile != null && videoFile.exists()) {
+                if (audioFile != null && audioFile.exists()) {
+                    // Merge internal audio track with video track and apply end trim
+                    VideoTrimmer.mergeAndTrim(videoFile, audioFile, finalTarget, trimSeconds)
+                } else if (trimSeconds > 0) {
+                    VideoTrimmer.trimEnd(videoFile, trimSeconds, finalTarget)
+                } else if (videoFile != finalTarget) {
+                    videoFile.renameTo(finalTarget)
+                }
+                VideoRepository.getInstance(applicationContext).refreshVideos()
+            }
+
+            _recorderState.value = RecorderState(status = RecorderStatus.IDLE)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    private fun cleanup() {
+        try {
+            virtualDisplay?.release()
+            virtualDisplay = null
+        } catch (_: Exception) {}
+
+        try {
+            mediaRecorder?.release()
+            mediaRecorder = null
+        } catch (_: Exception) {}
+
+        try {
+            internalAudioRecorder?.stop()
+            internalAudioRecorder = null
+        } catch (_: Exception) {}
+
+        try {
+            projectionCallback?.let { mediaProjection?.unregisterCallback(it) }
+            projectionCallback = null
+        } catch (_: Exception) {}
+
+        try {
+            mediaProjection?.stop()
+            mediaProjection = null
+        } catch (_: Exception) {}
+    }
+
+    private fun updateNotification(contentText: String) {
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(ScreenCraftApp.NOTIFICATION_ID, buildNotification(contentText))
+    }
+
+    private fun buildNotification(contentText: String): Notification {
+        val openAppIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val openAppPendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            openAppIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val stopIntent = Intent(this, ScreenRecorderService::class.java).apply {
+            action = ACTION_STOP
+        }
+        val stopPendingIntent = PendingIntent.getService(
+            this,
+            1,
+            stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val builder = NotificationCompat.Builder(this, ScreenCraftApp.NOTIFICATION_CHANNEL_ID)
+            .setContentTitle(getString(R.string.notification_recording_title))
+            .setContentText(contentText)
+            .setSmallIcon(R.drawable.ic_qs_record)
+            .setOngoing(true)
+            .setContentIntent(openAppPendingIntent)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, getString(R.string.notification_action_stop), stopPendingIntent)
+
+        return builder.build()
+    }
+
+    private fun formatSeconds(seconds: Long): String {
+        val m = seconds / 60
+        val s = seconds % 60
+        return String.format(Locale.US, "%02d:%02d", m, s)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        timerJob?.cancel()
+        cleanup()
+        _recorderState.value = RecorderState(status = RecorderStatus.IDLE)
+    }
+
+    companion object {
+        private const val TAG = "ScreenRecorderService"
+
+        const val ACTION_START = "com.example.action.START_RECORDING"
+        const val ACTION_STOP = "com.example.action.STOP_RECORDING"
+        const val ACTION_PAUSE = "com.example.action.PAUSE_RECORDING"
+        const val ACTION_RESUME = "com.example.action.RESUME_RECORDING"
+
+        const val EXTRA_RESULT_CODE = "extra_result_code"
+        const val EXTRA_RESULT_DATA = "extra_result_data"
+
+        // Cached permission token so Quick Settings tile can instantly toggle
+        var cachedResultCode: Int? = null
+        var cachedResultData: Intent? = null
+
+        private val _recorderState = MutableStateFlow(RecorderState())
+        val recorderState: StateFlow<RecorderState> = _recorderState.asStateFlow()
+
+        fun isRecording(): Boolean {
+            val s = _recorderState.value.status
+            return s == RecorderStatus.RECORDING || s == RecorderStatus.PAUSED || s == RecorderStatus.COUNTDOWN
+        }
+    }
+}
+
+enum class RecorderStatus {
+    IDLE,
+    COUNTDOWN,
+    RECORDING,
+    PAUSED,
+    STOPPING
+}
+
+data class RecorderState(
+    val status: RecorderStatus = RecorderStatus.IDLE,
+    val elapsedSeconds: Long = 0,
+    val countdownSeconds: Int = 0
+)

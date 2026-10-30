@@ -1,0 +1,8 @@
+{
+  "name": "SwiftScreen Recorder",
+  "description": "A lightweight, professional screen recorder featuring quick-toggle controls, internal audio capture, and seamless video management tools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

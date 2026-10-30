@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">ScreenCraft</string>
+    <string name="tile_screen_record">Screen Record</string>
+    <string name="tile_recording_active">Recording</string>
+    <string name="tile_recording_inactive">Screen Record</string>
+    <string name="notification_channel_name">Screen Recording Service</string>
+    <string name="notification_channel_desc">Notifications for ongoing screen recordings and countdowns</string>
+    <string name="notification_recording_title">ScreenCraft is Recording</string>
+    <string name="notification_recording_text">Tap Stop to finish and save recording</string>
+    <string name="notification_countdown_title">ScreenCraft Starting in</string>
+    <string name="notification_action_stop">Stop</string>
+    <string name="notification_action_pause">Pause</string>
+    <string name="notification_action_resume">Resume</string>
+    <string name="file_provider_authority">com.example.fileprovider</string>
+</resources>

@@ -51,6 +51,8 @@ class VideoRepository(private val context: Context) {
     }
 
     private fun cleanupOrphanedTempFiles(dir: File) {
+        val st = com.example.service.ScreenRecorderService.recorderState.value.status
+        if (st != com.example.service.RecorderStatus.IDLE) return
         try {
             dir.listFiles()?.forEach { file ->
                 if (file.isFile) {

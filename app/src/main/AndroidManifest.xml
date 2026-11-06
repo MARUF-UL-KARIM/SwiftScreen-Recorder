@@ -55,6 +55,13 @@
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
 
+        <!-- Service for MediaProjection Permissions and Frame Buffering -->
+        <service
+            android:name=".service.MediaProjectionFrameService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
         <!-- Quick Settings Tile Service -->
         <service
             android:name=".service.ScreenRecordTileService"

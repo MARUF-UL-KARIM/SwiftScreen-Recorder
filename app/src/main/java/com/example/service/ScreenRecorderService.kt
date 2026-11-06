@@ -199,11 +199,7 @@ class ScreenRecorderService : Service() {
 
             // When INTERNAL_ONLY is requested: STRICTLY DO NOT TOUCH MICROPHONE!
             // Video and internal audio are captured via dedicated pure digital pipeline
-            val videoTargetFile = if (isInternalAudio) {
-                File(recordingsDir, "temp_video_$timeStamp.mp4")
-            } else {
-                finalFile
-            }
+            val videoTargetFile = File(recordingsDir, "temp_video_$timeStamp.mp4")
             tempVideoFile = videoTargetFile
 
             // Ensure parent directory exists and File object is cleanly initialized before starting MediaRecorder
@@ -382,6 +378,10 @@ class ScreenRecorderService : Service() {
                 } else if (trimSeconds > 0) {
                     VideoTrimmer.trimEnd(videoFile, trimSeconds, finalTarget)
                 } else if (videoFile != finalTarget) {
+                    videoFile.renameTo(finalTarget)
+                }
+
+                if (!finalTarget.exists() && videoFile.exists() && videoFile.length() > 0) {
                     videoFile.renameTo(finalTarget)
                 }
 

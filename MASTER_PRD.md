@@ -211,3 +211,32 @@ On Android 8.1 / 9 devices:
 - **Stop Trim Chips:** Formatted labels to `"Off"`, `"1s"`, `"2s"`, `"3s"`, `"5s"` to guarantee seamless fit across 720px wide viewports without horizontal text wrapping.
 - **Touch Targets:** Adjusted action buttons (`Share`, `Rename`, `Delete`) to `40.dp` with expanded padding complying with Android Accessibility guidelines.
 - **FileProvider Paths:** Added `<external-path name="external_root" path="." />` ensuring broad coverage for all external storage sharing operations.
+
+### 9.7 GitHub Actions Checksum Formatting Fix for Release Pipeline
+- **Issue:** The GitHub Actions workflow `publish-apk.yml` executes `cd apk-distribution` followed by `sha256sum -c app-debug.apk.sha256`. Previously, `app-debug.apk.sha256` was formatted with a relative path prefix (`apk-distribution/app-debug.apk`), causing `sha256sum` inside `apk-distribution/` to evaluate the file path as `apk-distribution/apk-distribution/app-debug.apk`, failing with `No such file or directory` (Exit Code 1).
+- **Resolution:** Updated `apk-distribution/app-debug.apk.sha256` to reference the file using its base filename (`app-debug.apk`), calculated via `(cd apk-distribution && sha256sum app-debug.apk > app-debug.apk.sha256)`. Both `sha256sum -c app-debug.apk.sha256` inside `apk-distribution` and `unzip -tq apk-distribution/app-debug.apk` in root now execute cleanly and validate successfully in GitHub Actions.
+
+### 9.8 Active Recording Temp File Protection & Isolated Target File Pipeline (v1.2.1)
+- **Issue 1 (Active Temp File Erasure):** `VideoRepository.cleanupOrphanedTempFiles()` executed during `refreshVideos()` whenever the UI rendered or refreshed state. If the user opened the app during an active recording, `cleanupOrphanedTempFiles` immediately deleted the active recording's `temp_video_...mp4` file, causing zero-byte or missing video output upon stopping.
+  - *Fix:* Added `val st = ScreenRecorderService.recorderState.value.status; if (st != RecorderStatus.IDLE) return` inside `cleanupOrphanedTempFiles(dir: File)` to bypass temp file deletion whenever recording is active.
+- **Issue 2 (Muted/Internal+Mic File Truncation & Deletion):** When recording in Muted or Internal+Mic audio mode, `videoTargetFile` defaulted to `finalFile`. During `stopRecording()`, `VideoTrimmer.trimEnd(videoFile, trimSeconds, finalTarget)` attempted to read and write to the exact same file path (`videoFile == finalTarget`), truncating/corrupting the video and then deleting it via `sourceFile.delete()`.
+  - *Fix:* Updated `ScreenRecorderService.kt` to consistently route `videoTargetFile` to `File(recordingsDir, "temp_video_$timeStamp.mp4")` across all audio modes. Added a rename safety net (`if (!finalTarget.exists() && videoFile.exists() && videoFile.length() > 0) videoFile.renameTo(finalTarget)`) before MediaStore indexing.
+
+---
+
+## 10. MediaProjection Service & Frame Buffering Architecture (`MediaProjectionFrameService`)
+
+### 10.1 Overview & Responsibilities
+`MediaProjectionFrameService` is a dedicated Android Service (`android.app.Service`) engineered to handle screen capture token management, system lifecycle callbacks, and high-throughput frame buffering for screen recording on Android 8.1+ (API 27+):
+- **Permission & Token Lifecycle:** Manages `MediaProjection` instances from user-granted `resultCode` and `resultData` intents. Caches valid credentials (`cachedResultCode`, `cachedResultData`) for instant capture initiation.
+- **Android 14+ (API 34+) Callback Gate:** Mandatory `MediaProjection.Callback` registration via `mediaProjection.registerCallback(callback, Handler(Looper.getMainLooper()))` executed strictly **before** calling `createVirtualDisplay`, preventing runtime security exceptions on Android 14.
+- **Foreground Service Compliance:** Declared with `android:foregroundServiceType="mediaProjection"` in `AndroidManifest.xml` and invoked with `FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION` on Android 10+ (API 29+), maintaining full background privilege without being killed by the Android OS low-memory killer.
+
+### 10.2 Triple-Buffered Frame Pipeline
+1. **Resolution Calibration:** Specifically calibrated to **720×1520 px** (`DEFAULT_WIDTH = 720`, `DEFAULT_HEIGHT = 1520`, `DEFAULT_DPI = 320`), perfectly matching 19:9 phone screen viewports with zero scaling distortion.
+2. **Buffer Pool Configuration:** Instantiates `ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3)` with a **triple buffer pool** (`maxImages = 3`). This allows the display compositor, frame consumer, and encoder pipeline to work concurrently without blocking or dropping frames.
+3. **Dedicated Background HandlerThread:** All frame acquisition operations run on a dedicated worker thread (`FrameBufferThread`), ensuring heavy memory copies or image transformations never cause UI thread jank or frame skipping.
+4. **Leak-Free Frame Processing (`BufferedFrame`):** Encapsulates raw plane byte buffers with explicit pixel stride and row stride handling. Every acquired `Image` is immediately closed in a strict `try ... finally { image?.close() }` block, preventing native buffer starvation and memory leaks.
+5. **Direct VirtualDisplay Surface Binding:** Allows seamless binding of either `ImageReader.surface` for raw frame access/streaming or direct encoder `Surface` from `MediaRecorder`/`MediaCodec`.
+
+

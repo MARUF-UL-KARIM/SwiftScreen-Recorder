@@ -47,4 +47,30 @@ class ScreenCraftUnitTest {
         assertEquals("15.0 MB", video.formattedSize)
         assertEquals("720×1520", video.resolutionLabel)
     }
+
+    @Test
+    fun testMediaProjectionFrameServiceDefaults() {
+        assertEquals(720, com.example.service.MediaProjectionFrameService.DEFAULT_WIDTH)
+        assertEquals(1520, com.example.service.MediaProjectionFrameService.DEFAULT_HEIGHT)
+        assertEquals(320, com.example.service.MediaProjectionFrameService.DEFAULT_DPI)
+        assertEquals(com.example.service.CaptureState.IDLE, com.example.service.MediaProjectionFrameService.captureState.value)
+    }
+
+    @Test
+    fun testBufferedFrameProperties() {
+        val buffer = java.nio.ByteBuffer.allocate(720 * 1520 * 4)
+        val frame = com.example.service.BufferedFrame(
+            width = 720,
+            height = 1520,
+            timestampNs = 1_000_000L,
+            buffer = buffer,
+            pixelStride = 4,
+            rowStride = 720 * 4
+        )
+        assertEquals(720, frame.width)
+        assertEquals(1520, frame.height)
+        assertEquals(1_000_000L, frame.timestampNs)
+        assertEquals(4, frame.pixelStride)
+        assertEquals(2880, frame.rowStride)
+    }
 }

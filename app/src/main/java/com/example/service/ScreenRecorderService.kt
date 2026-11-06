@@ -252,22 +252,10 @@ class ScreenRecorderService : Service() {
 
             recorder.prepare()
 
-            // 1. Surface MUST be retrieved after prepare() and BEFORE start()
+            // 1. Surface MUST be retrieved after prepare()
             val surface = recorder.surface
 
-            // 2. Create VirtualDisplay attached to the prepared surface
-            virtualDisplay = projection.createVirtualDisplay(
-                "ScreenCraftDisplay",
-                width,
-                height,
-                dpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                surface,
-                null,
-                null
-            )
-
-            // 3. Start pure digital internal audio capture (ZERO microphone hardware)
+            // 2. Start pure digital internal audio capture (ZERO microphone hardware)
             if (isInternalAudio) {
                 val audioFile = File(recordingsDir, "temp_audio_$timeStamp.m4a")
                 tempAudioFile = audioFile
@@ -282,8 +270,20 @@ class ScreenRecorderService : Service() {
                 }
             }
 
-            // 4. Start MediaRecorder
+            // 3. Start MediaRecorder FIRST so surface receiver is actively consuming frames
             recorder.start()
+
+            // 4. Create VirtualDisplay attached to the actively recording surface
+            virtualDisplay = projection.createVirtualDisplay(
+                "ScreenCraftDisplay",
+                width,
+                height,
+                dpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                surface,
+                null,
+                null
+            )
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start screen recording", e)
@@ -326,29 +326,22 @@ class ScreenRecorderService : Service() {
         updateNotification("Saving & Processing video...")
 
         serviceScope.launch(Dispatchers.IO) {
+            val finalTarget = currentFinalOutputFile
+            val videoFile = tempVideoFile
+            val audioFile = tempAudioFile
+            val trimSeconds = currentSettings?.stopTrimSeconds ?: 0
+
             val elapsed = _recorderState.value.elapsedSeconds
-            if (elapsed == 0L) {
+            if (elapsed < 2L) {
                 try {
-                    Thread.sleep(1000)
+                    Thread.sleep(1500)
                 } catch (_: Exception) {}
             }
 
-            // 1. Release VirtualDisplay FIRST so no more surface frames push during shutdown
-            try {
-                virtualDisplay?.release()
-                virtualDisplay = null
-            } catch (e: Exception) {
-                Log.w(TAG, "VirtualDisplay release: ${e.message}")
-            }
-
-            // 2. Allow MPEG4Writer and encoder pipeline 350ms to complete pending frame buffers
-            try {
-                Thread.sleep(350)
-            } catch (_: Exception) {}
-
-            // 3. Stop MediaRecorder cleanly
+            // 1. Stop MediaRecorder FIRST while VirtualDisplay is still active and feeding the surface
             try {
                 mediaRecorder?.stop()
+                Log.d(TAG, "MediaRecorder stopped cleanly. Video file length: ${videoFile?.length()}")
             } catch (e: Exception) {
                 Log.w(TAG, "MediaRecorder stop handled: ${e.message}")
             }
@@ -356,7 +349,15 @@ class ScreenRecorderService : Service() {
                 mediaRecorder?.reset()
             } catch (_: Exception) {}
 
-            // 4. Stop internal audio recorder if active
+            // 2. Release VirtualDisplay AFTER MediaRecorder has stopped and finalized the moov atom
+            try {
+                virtualDisplay?.release()
+                virtualDisplay = null
+            } catch (e: Exception) {
+                Log.w(TAG, "VirtualDisplay release: ${e.message}")
+            }
+
+            // 3. Stop internal audio recorder if active
             try {
                 internalAudioRecorder?.stop()
                 internalAudioRecorder = null
@@ -367,16 +368,18 @@ class ScreenRecorderService : Service() {
             }
 
             // Post-Processing: Lossless Video and Internal Audio Muxing + Stop Trimming
-            val finalTarget = currentFinalOutputFile
-            val videoFile = tempVideoFile
-            val audioFile = tempAudioFile
-            val trimSeconds = currentSettings?.stopTrimSeconds ?: 0
-
             if (finalTarget != null && videoFile != null && videoFile.exists() && videoFile.length() > 0) {
                 if (audioFile != null && audioFile.exists() && audioFile.length() > 0) {
                     VideoTrimmer.mergeAndTrim(videoFile, audioFile, finalTarget, trimSeconds)
                 } else if (trimSeconds > 0) {
-                    VideoTrimmer.trimEnd(videoFile, trimSeconds, finalTarget)
+                    val trimmed = VideoTrimmer.trimEnd(videoFile, trimSeconds, finalTarget)
+                    if (!finalTarget.exists() || finalTarget.length() == 0L) {
+                        if (trimmed.exists() && trimmed.length() > 0) {
+                            trimmed.renameTo(finalTarget)
+                        } else if (videoFile.exists() && videoFile.length() > 0) {
+                            videoFile.renameTo(finalTarget)
+                        }
+                    }
                 } else if (videoFile != finalTarget) {
                     videoFile.renameTo(finalTarget)
                 }

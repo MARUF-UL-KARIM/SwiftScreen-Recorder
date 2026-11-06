@@ -222,6 +222,12 @@ On Android 8.1 / 9 devices:
 - **Issue 2 (Muted/Internal+Mic File Truncation & Deletion):** When recording in Muted or Internal+Mic audio mode, `videoTargetFile` defaulted to `finalFile`. During `stopRecording()`, `VideoTrimmer.trimEnd(videoFile, trimSeconds, finalTarget)` attempted to read and write to the exact same file path (`videoFile == finalTarget`), truncating/corrupting the video and then deleting it via `sourceFile.delete()`.
   - *Fix:* Updated `ScreenRecorderService.kt` to consistently route `videoTargetFile` to `File(recordingsDir, "temp_video_$timeStamp.mp4")` across all audio modes. Added a rename safety net (`if (!finalTarget.exists() && videoFile.exists() && videoFile.length() > 0) videoFile.renameTo(finalTarget)`) before MediaStore indexing.
 
+### 9.9 Android 8.1 Zero-Byte Video Fix: MediaRecorder & VirtualDisplay Lifecycle Inversion (v1.2.2)
+- **Root Cause (The 0-Byte Video Culprit):** On Android 8.1 (API 27), `virtualDisplay?.release()` was previously invoked *before* `mediaRecorder?.stop()`. Tearing down the `VirtualDisplay` abruptly destroyed the input surface buffer queue. When `mediaRecorder.stop()` was subsequently invoked, the native MPEG4Writer crashed with `stop failed: -1007` because the upstream surface producer was already dead. Consequently, `MediaRecorder` never wrote the MP4 `moov` atom header/trailer, leaving an unfinalized 0-byte file on disk which the subsequent cleanup logic pruned.
+- **Start Sequence Realignment:** In `initAndStartRecorder`, `recorder.start()` is now invoked *before* `projection.createVirtualDisplay(...)`. This ensures the hardware video encoder and surface consumer are active and listening before the virtual display begins pushing frame buffers.
+- **Stop Sequence Inversion:** In `stopRecording()`, `mediaRecorder?.stop()` is now strictly executed *first* while the virtual display is still feeding the surface. Only after the MP4 container is finalized is `virtualDisplay?.release()` executed.
+- **Public Storage Probe & Fallback Migration:** `VideoRepository.getRecordingsDir()` now employs an active probe file test instead of unreliable `File.canWrite()` checks (which fail on Android FUSE/sdcardfs mounts), ensuring videos always save to `/storage/emulated/0/Movies/ScreenCraft` for immediate system Gallery indexing. In addition, `refreshVideos()` automatically migrates any legacy recordings from app-private storage into the public Gallery directory.
+
 ---
 
 ## 10. MediaProjection Service & Frame Buffering Architecture (`MediaProjectionFrameService`)

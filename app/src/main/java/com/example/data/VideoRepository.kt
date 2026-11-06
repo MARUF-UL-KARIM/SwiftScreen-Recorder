@@ -20,13 +20,31 @@ class VideoRepository(private val context: Context) {
 
     fun getRecordingsDir(): File {
         // Preferred: public Movies/ScreenCraft directory so videos appear directly in Gallery and Files
-        val publicMovies = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
-        val screenCraftDir = File(publicMovies, "ScreenCraft")
-        if (!screenCraftDir.exists()) {
-            screenCraftDir.mkdirs()
-        }
-        if (screenCraftDir.exists() && screenCraftDir.canWrite()) {
-            return screenCraftDir
+        try {
+            val publicMovies = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
+            if (!publicMovies.exists()) {
+                publicMovies.mkdirs()
+            }
+            val screenCraftDir = File(publicMovies, "ScreenCraft")
+            if (!screenCraftDir.exists()) {
+                screenCraftDir.mkdirs()
+            }
+            if (screenCraftDir.exists()) {
+                val probe = File(screenCraftDir, ".probe_${System.currentTimeMillis()}")
+                val isWritable = try {
+                    if (probe.createNewFile()) {
+                        probe.delete()
+                        true
+                    } else screenCraftDir.canWrite()
+                } catch (_: Exception) {
+                    screenCraftDir.canWrite()
+                }
+                if (isWritable) {
+                    return screenCraftDir
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("VideoRepository", "Public Movies directory probe note: ${e.message}")
         }
 
         // Fallback: app external files directory if public directory is not writable yet
@@ -84,7 +102,16 @@ class VideoRepository(private val context: Context) {
         if (fallbackDir != null && fallbackDir.exists() && fallbackDir != primaryDir) {
             fallbackDir.listFiles { file ->
                 file.isFile && file.extension.lowercase() == "mp4" && file.length() > 0 && !file.name.startsWith("temp_")
-            }?.let { allFiles.addAll(it) }
+            }?.forEach { fallbackFile ->
+                val targetFile = File(primaryDir, fallbackFile.name)
+                if (!targetFile.exists() && fallbackFile.renameTo(targetFile)) {
+                    allFiles.add(targetFile)
+                    scanFileForGallery(targetFile)
+                } else {
+                    allFiles.add(fallbackFile)
+                    scanFileForGallery(fallbackFile)
+                }
+            }
         }
 
         val list = allFiles.distinctBy { it.name }.mapNotNull { file ->

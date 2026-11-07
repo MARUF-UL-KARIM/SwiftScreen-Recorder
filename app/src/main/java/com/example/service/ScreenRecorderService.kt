@@ -55,6 +55,7 @@ class ScreenRecorderService : Service() {
     private var currentFinalOutputFile: File? = null
     private var tempVideoFile: File? = null
     private var tempAudioFile: File? = null
+    private var outputPfd: android.os.ParcelFileDescriptor? = null
     private var currentSettings: RecordingSettings? = null
     private var isPaused = false
 
@@ -248,7 +249,13 @@ class ScreenRecorderService : Service() {
             recorder.setVideoSize(width, height)
             recorder.setVideoFrameRate(settings.fps)
             recorder.setVideoEncodingBitRate(settings.bitrateMbps * 1000 * 1000)
-            recorder.setOutputFile(videoTargetFile.absolutePath)
+
+            val pfd = android.os.ParcelFileDescriptor.open(
+                videoTargetFile,
+                android.os.ParcelFileDescriptor.MODE_READ_WRITE or android.os.ParcelFileDescriptor.MODE_CREATE
+            )
+            outputPfd = pfd
+            recorder.setOutputFile(pfd.fileDescriptor)
 
             recorder.prepare()
 
@@ -419,6 +426,11 @@ class ScreenRecorderService : Service() {
         try {
             mediaRecorder?.release()
             mediaRecorder = null
+        } catch (_: Exception) {}
+
+        try {
+            outputPfd?.close()
+            outputPfd = null
         } catch (_: Exception) {}
 
         try {

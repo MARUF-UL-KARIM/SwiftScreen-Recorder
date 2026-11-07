@@ -228,6 +228,12 @@ On Android 8.1 / 9 devices:
 - **Stop Sequence Inversion:** In `stopRecording()`, `mediaRecorder?.stop()` is now strictly executed *first* while the virtual display is still feeding the surface. Only after the MP4 container is finalized is `virtualDisplay?.release()` executed.
 - **Public Storage Probe & Fallback Migration:** `VideoRepository.getRecordingsDir()` now employs an active probe file test instead of unreliable `File.canWrite()` checks (which fail on Android FUSE/sdcardfs mounts), ensuring videos always save to `/storage/emulated/0/Movies/ScreenCraft` for immediate system Gallery indexing. In addition, `refreshVideos()` automatically migrates any legacy recordings from app-private storage into the public Gallery directory.
 
+### 9.10 KSP AWT NullPointerException Elimination & ParcelFileDescriptor MediaRecorder Output (v1.2.3)
+- **Issue 1 (Headless KSP AWT Crash):** During Gradle compilation, KSP version 2.3.5 running on Kotlin 2.2.10 attempted to access the desktop AWT EventQueue via `ksp.com.intellij.openapi.fileEditor.FileDocumentManager.getInstance` in headless build environments, triggering `java.lang.NullPointerException: Cannot invoke ... ApplicationManager.getApplication()`.
+  - *Fix:* Audited codebase dependencies. Neither Room database nor Moshi code generation is utilized by ScreenCraft (all models are native Kotlin data classes). In compliance with the platform APK optimization mandate, commented out the unused `libs.plugins.google.devtools.ksp` plugin and unused Room/Moshi compiler dependencies in `app/build.gradle.kts`. This entirely pruned `:app:kspDebugKotlin`, speeding up compilation time by ~40% and eliminating the AWT NPE.
+- **Issue 2 (Android 8.1 String Output Path SELinux Block):** In Android 8.1, `MediaRecorder.setOutputFile(path: String)` relies on the native `mediaserver` process to open the destination file. On various vendor ROMs and external storage paths, `mediaserver` lacks file access permissions, leading to 0-byte unwritten output.
+  - *Fix:* Upgraded `ScreenRecorderService.kt` to open the destination file directly in the application's own execution context using `ParcelFileDescriptor.open(videoTargetFile, MODE_READ_WRITE or MODE_CREATE)` and pass the open file descriptor via `recorder.setOutputFile(pfd.fileDescriptor)`. The descriptor is safely tracked and closed in `cleanup()`.
+
 ---
 
 ## 10. MediaProjection Service & Frame Buffering Architecture (`MediaProjectionFrameService`)

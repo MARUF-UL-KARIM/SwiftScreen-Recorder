@@ -52,7 +52,7 @@ class ScreenVideoEncoder(
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
         }
 
-        try {
+        return try {
             outputFile.parentFile?.mkdirs()
             if (outputFile.exists()) outputFile.delete()
 
@@ -68,7 +68,7 @@ class ScreenVideoEncoder(
             val t = Thread({ drainLoop(c) }, "ScreenVideoEncoderDrain")
             drainThread = t
             t.start()
-            return surface
+            surface
         } catch (t: Throwable) {
             releaseInternal()
             throw t

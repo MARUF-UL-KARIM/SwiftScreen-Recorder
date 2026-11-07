@@ -9,10 +9,10 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
-import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Environment
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -27,6 +27,7 @@ import com.example.data.SettingsRepository
 import com.example.data.VideoRepository
 import com.example.model.AudioMode
 import com.example.model.RecordingSettings
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -48,14 +49,13 @@ class ScreenRecorderService : Service() {
 
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
-    private var mediaRecorder: MediaRecorder? = null
+    private var screenEncoder: ScreenVideoEncoder? = null
     private var internalAudioRecorder: InternalAudioCaptureRecorder? = null
     private var projectionCallback: MediaProjection.Callback? = null
 
     private var currentFinalOutputFile: File? = null
     private var tempVideoFile: File? = null
     private var tempAudioFile: File? = null
-    private var outputPfd: android.os.ParcelFileDescriptor? = null
     private var currentSettings: RecordingSettings? = null
     private var isPaused = false
 
@@ -79,20 +79,26 @@ class ScreenRecorderService : Service() {
                     cachedResultData = resultData
                     startForegroundServiceWithNotification("Preparing...")
                     startCountdownAndRecording(resultCode, resultData)
+                } else {
+                    // Must still satisfy startForegroundService() on Android 8+
+                    startForegroundServiceWithNotification("Preparing...")
+                    toast("Screen capture permission paoa jayni")
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
                 }
             }
-            ACTION_STOP -> {
-                stopRecording()
-            }
-            ACTION_PAUSE -> {
-                pauseRecording()
-            }
-            ACTION_RESUME -> {
-                resumeRecording()
-            }
+            ACTION_STOP -> stopRecording()
+            ACTION_PAUSE -> pauseRecording()
+            ACTION_RESUME -> resumeRecording()
         }
 
         return START_NOT_STICKY
+    }
+
+    private fun toast(message: String) {
+        Handler(Looper.getMainLooper()).post {
+            android.widget.Toast.makeText(applicationContext, message, android.widget.Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun startForegroundServiceWithNotification(content: String) {
@@ -111,13 +117,19 @@ class ScreenRecorderService : Service() {
     private fun startCountdownAndRecording(resultCode: Int, resultData: Intent) {
         val settings = SettingsRepository.getInstance(this).settings.value
         currentSettings = settings
+        isPaused = false
         val delaySec = settings.startDelaySeconds
 
-        // Secure MediaProjection immediately upon receiving token
         val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val projection = projectionManager.getMediaProjection(resultCode, resultData)
+        val projection = try {
+            projectionManager.getMediaProjection(resultCode, resultData)
+        } catch (t: Throwable) {
+            DebugLog.log(this, TAG, "getMediaProjection threw", t)
+            null
+        }
         if (projection == null) {
-            Log.e(TAG, "MediaProjection token invalid or expired")
+            DebugLog.log(this, TAG, "MediaProjection token invalid or expired")
+            toast("Screen capture permission expired, abar try koro")
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return
@@ -127,7 +139,7 @@ class ScreenRecorderService : Service() {
         val callback = object : MediaProjection.Callback() {
             override fun onStop() {
                 super.onStop()
-                Log.d(TAG, "MediaProjection stopped by system")
+                DebugLog.log(this@ScreenRecorderService, TAG, "MediaProjection stopped by system")
                 stopRecording()
             }
         }
@@ -147,7 +159,6 @@ class ScreenRecorderService : Service() {
                 }
             }
 
-            // Begin recording using pre-validated projection
             val success = initAndStartRecorder(projection, settings)
             if (success) {
                 var elapsedSec = 0L
@@ -160,8 +171,7 @@ class ScreenRecorderService : Service() {
                     if (!isPaused) {
                         elapsedSec++
                         _recorderState.value = _recorderState.value.copy(elapsedSeconds = elapsedSec)
-                        val formatted = formatSeconds(elapsedSec)
-                        updateNotification("Recording • $formatted")
+                        updateNotification("Recording • ${formatSeconds(elapsedSec)}")
                     }
                 }
             } else {
@@ -185,11 +195,11 @@ class ScreenRecorderService : Service() {
         )
         for ((index, a) in attempts.withIndex()) {
             if (tryInitAndStartRecorder(projection, settings, a.first, a.second, a.third)) return true
-            if (index < attempts.lastIndex) Log.w(TAG, "Recorder start failed, retrying with safer config #${index + 2}")
+            if (index < attempts.lastIndex) {
+                DebugLog.log(this, TAG, "Recorder start failed, retrying with safer config #${index + 2}")
+            }
         }
-        Handler(Looper.getMainLooper()).post {
-            android.widget.Toast.makeText(this, "Screen recording start korte parlo na (device encoder issue)", android.widget.Toast.LENGTH_LONG).show()
-        }
+        toast("Screen recording start korte parlo na (encoder error). Log: Android/data/$packageName/files/screencraft_log.txt")
         return false
     }
 
@@ -208,7 +218,6 @@ class ScreenRecorderService : Service() {
 
             val (baseWidth, baseHeight) = settings.resolution.getDimensions(metrics.widthPixels, metrics.heightPixels)
             val isPortrait = metrics.heightPixels >= metrics.widthPixels
-            // Ensure 720x1520 exact dimensions for MATCH_SCREEN and HD_720P on 720x1520 device
             val targetWidth = if (settings.resolution.isMatchScreen && minOf(metrics.widthPixels, metrics.heightPixels) in 700..740) 720 else minOf(baseWidth, baseHeight)
             val targetHeight = if (settings.resolution.isMatchScreen && maxOf(metrics.widthPixels, metrics.heightPixels) in 1500..1540) 1520 else maxOf(baseWidth, baseHeight)
             val rawW = if (isPortrait) targetWidth else targetHeight
@@ -220,96 +229,36 @@ class ScreenRecorderService : Service() {
 
             val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             val recordingsDir = VideoRepository.getInstance(this).getRecordingsDir()
-
-            val finalFile = File(recordingsDir, "ScreenCraft_$timeStamp.mp4")
-            currentFinalOutputFile = finalFile
+            currentFinalOutputFile = File(recordingsDir, "ScreenCraft_$timeStamp.mp4")
 
             val isInternalAudio = settings.audioMode == AudioMode.INTERNAL_ONLY
             val isMicAudio = settings.audioMode == AudioMode.INTERNAL_AND_MIC &&
                 androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO) ==
                 android.content.pm.PackageManager.PERMISSION_GRANTED
 
-            // When INTERNAL_ONLY is requested: STRICTLY DO NOT TOUCH MICROPHONE!
-            // Video and internal audio are captured via dedicated pure digital pipeline
+            // Temp files live in the app's private cache: nothing else can touch/delete them while recording
             val tempDir = File(cacheDir, "recording_tmp").apply { mkdirs() }
             val videoTargetFile = File(tempDir, "temp_video_$timeStamp.mp4")
             tempVideoFile = videoTargetFile
 
-            // Ensure parent directory exists and File object is cleanly initialized before starting MediaRecorder
-            try {
-                videoTargetFile.parentFile?.mkdirs()
-                if (videoTargetFile.exists()) {
-                    videoTargetFile.delete()
-                }
-                videoTargetFile.createNewFile()
-                Log.d(TAG, "Output File initialized at: ${videoTargetFile.absolutePath}")
-            } catch (e: Exception) {
-                Log.w(TAG, "File object creation notice: ${e.message}")
-            }
+            DebugLog.log(this, TAG, "Starting encoder ${width}x$height @${fpsToUse}fps ${bitrateMbpsToUse}Mbps -> ${videoTargetFile.absolutePath}; final=${currentFinalOutputFile?.absolutePath}")
 
-            val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                MediaRecorder(this)
-            } else {
-                @Suppress("DEPRECATION")
-                MediaRecorder()
-            }
-            mediaRecorder = recorder
+            val encoder = ScreenVideoEncoder(width, height, fpsToUse, bitrateMbpsToUse * 1_000_000, videoTargetFile)
+            screenEncoder = encoder
+            val surface = encoder.start()
 
-            // ONLY engage microphone if the user explicitly chose INTERNAL_AND_MIC
-            if (isMicAudio) {
-                try {
-                    recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Microphone audio source warning", e)
-                }
-            }
-
-            recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
-            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-
-            if (isMicAudio) {
-                try {
-                    recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                    recorder.setAudioEncodingBitRate(192_000)
-                    recorder.setAudioSamplingRate(48000)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Audio encoder setup warning", e)
-                }
-            }
-
-            recorder.setVideoSize(width, height)
-            recorder.setVideoFrameRate(fpsToUse)
-            recorder.setVideoEncodingBitRate(bitrateMbpsToUse * 1000 * 1000)
-
-            val pfd = android.os.ParcelFileDescriptor.open(
-                videoTargetFile,
-                android.os.ParcelFileDescriptor.MODE_READ_WRITE or android.os.ParcelFileDescriptor.MODE_CREATE
-            )
-            outputPfd = pfd
-            recorder.setOutputFile(pfd.fileDescriptor)
-
-            recorder.prepare()
-
-            // 1. Surface MUST be retrieved after prepare()
-            val surface = recorder.surface
-
-            // 2. Start pure digital internal audio capture (ZERO microphone hardware)
-            if (isInternalAudio) {
+            if (isInternalAudio || isMicAudio) {
                 val audioFile = File(tempDir, "temp_audio_$timeStamp.m4a")
-                tempAudioFile = audioFile
-                val internalRecorder = InternalAudioCaptureRecorder(projection, audioFile)
-                val started = internalRecorder.start()
-                if (started) {
-                    internalAudioRecorder = internalRecorder
-                    Log.d(TAG, "Started pure internal digital audio recorder (No microphone used)")
+                val rec = InternalAudioCaptureRecorder(projection, audioFile, useMicrophone = isMicAudio)
+                if (rec.start()) {
+                    internalAudioRecorder = rec
+                    tempAudioFile = audioFile
                 } else {
-                    Log.w(TAG, "Pure internal audio not available on this ROM; recording video cleanly without microphone")
+                    DebugLog.log(this, TAG, "Audio capture not available on this ROM; recording video only")
                     tempAudioFile = null
                 }
             }
 
-            // 3. Create VirtualDisplay on the recorder surface, THEN start the recorder (standard, Android 8 safe order)
             virtualDisplay = projection.createVirtualDisplay(
                 "ScreenCraftDisplay",
                 width,
@@ -320,147 +269,171 @@ class ScreenRecorderService : Service() {
                 null,
                 null
             )
-            recorder.start()
             true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start screen recording", e)
+        } catch (t: Throwable) {
+            DebugLog.log(this, TAG, "Failed to start screen recording", t)
             releaseRecorderOnly()
             false
         }
     }
 
     private fun pauseRecording() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && !isPaused) {
-            try {
-                mediaRecorder?.pause()
-                isPaused = true
-                _recorderState.value = _recorderState.value.copy(status = RecorderStatus.PAUSED)
-                updateNotification("Recording Paused")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to pause recording", e)
-            }
-        }
+        if (isPaused || _recorderState.value.status != RecorderStatus.RECORDING) return
+        screenEncoder?.pause()
+        internalAudioRecorder?.paused = true
+        isPaused = true
+        _recorderState.value = _recorderState.value.copy(status = RecorderStatus.PAUSED)
+        updateNotification("Recording Paused")
     }
 
     private fun resumeRecording() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isPaused) {
-            try {
-                mediaRecorder?.resume()
-                isPaused = false
-                _recorderState.value = _recorderState.value.copy(status = RecorderStatus.RECORDING)
-                val formatted = formatSeconds(_recorderState.value.elapsedSeconds)
-                updateNotification("Recording • $formatted")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to resume recording", e)
-            }
-        }
+        if (!isPaused) return
+        screenEncoder?.resume()
+        internalAudioRecorder?.paused = false
+        isPaused = false
+        _recorderState.value = _recorderState.value.copy(status = RecorderStatus.RECORDING)
+        updateNotification("Recording • ${formatSeconds(_recorderState.value.elapsedSeconds)}")
     }
 
     private fun stopRecording() {
         if (_recorderState.value.status == RecorderStatus.STOPPING) return
+        if (_recorderState.value.status == RecorderStatus.IDLE && screenEncoder == null) {
+            // Nothing is recording (e.g. stale Stop tap)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
         timerJob?.cancel()
         _recorderState.value = RecorderState(status = RecorderStatus.STOPPING)
         updateNotification("Saving & Processing video...")
 
-        serviceScope.launch(Dispatchers.IO) {
+        val handler = CoroutineExceptionHandler { _, t ->
+            DebugLog.log(this, TAG, "Uncaught error while stopping", t)
+        }
+
+        serviceScope.launch(Dispatchers.IO + handler) {
             val finalTarget = currentFinalOutputFile
             val videoFile = tempVideoFile
             val audioFile = tempAudioFile
             val trimSeconds = currentSettings?.stopTrimSeconds ?: 0
 
-            val elapsed = _recorderState.value.elapsedSeconds
-            if (elapsed < 2L) {
+            try {
+                // 1. Stop feeding frames, then finish the encoder (flushes the last frames + writes the MP4 index)
                 try {
-                    Thread.sleep(1500)
-                } catch (_: Exception) {}
-            }
-
-            // 1. Stop MediaRecorder FIRST while VirtualDisplay is still active and feeding the surface
-            try {
-                mediaRecorder?.stop()
-                Log.d(TAG, "MediaRecorder stopped cleanly. Video file length: ${videoFile?.length()}")
-            } catch (e: Exception) {
-                Log.w(TAG, "MediaRecorder stop handled: ${e.message}")
-            }
-            try {
-                mediaRecorder?.reset()
-            } catch (_: Exception) {}
-
-            // 2. Release VirtualDisplay AFTER MediaRecorder has stopped and finalized the moov atom
-            try {
-                virtualDisplay?.release()
+                    virtualDisplay?.release()
+                } catch (t: Throwable) {
+                    DebugLog.log(this@ScreenRecorderService, TAG, "VirtualDisplay release failed", t)
+                }
                 virtualDisplay = null
-            } catch (e: Exception) {
-                Log.w(TAG, "VirtualDisplay release: ${e.message}")
-            }
 
-            // 3. Stop internal audio recorder if active
-            try {
-                internalAudioRecorder?.stop()
+                val encoder = screenEncoder
+                val encoderOk = try {
+                    encoder?.stop() ?: false
+                } catch (t: Throwable) {
+                    DebugLog.log(this@ScreenRecorderService, TAG, "Encoder stop failed", t)
+                    false
+                }
+                screenEncoder = null
+                DebugLog.log(
+                    this@ScreenRecorderService, TAG,
+                    "Encoder stopped ok=$encoderOk samples=${encoder?.samplesWritten} err=${encoder?.lastError} videoSize=${videoFile?.length()}"
+                )
+
+                // 2. Stop audio
+                try {
+                    internalAudioRecorder?.stop()
+                } catch (t: Throwable) {
+                    DebugLog.log(this@ScreenRecorderService, TAG, "Audio stop failed", t)
+                }
                 internalAudioRecorder = null
-            } catch (e: Exception) {
-                Log.e(TAG, "Error stopping internal audio recorder", e)
-            } finally {
                 cleanup()
-            }
 
-            // Post-Processing: Lossless Video and Internal Audio Muxing + Stop Trimming
-            if (finalTarget != null && videoFile != null && videoFile.exists() && videoFile.length() > 0) {
-                if (audioFile != null && audioFile.exists() && audioFile.length() > 0) {
-                    VideoTrimmer.mergeAndTrim(videoFile, audioFile, finalTarget, trimSeconds)
-                } else if (trimSeconds > 0) {
-                    val trimmed = VideoTrimmer.trimEnd(videoFile, trimSeconds, finalTarget)
-                    if (!finalTarget.exists() || finalTarget.length() == 0L) {
-                        if (trimmed.exists() && trimmed.length() > 0) {
-                            moveFile(trimmed, finalTarget)
-                        } else if (videoFile.exists() && videoFile.length() > 0) {
-                            moveFile(videoFile, finalTarget)
-                        }
+                // 3. Save
+                if (finalTarget != null && videoFile != null && videoFile.exists() && videoFile.length() > 0) {
+                    val saved = finalizeVideo(videoFile, audioFile, finalTarget, trimSeconds)
+                    if (saved != null) {
+                        VideoRepository.getInstance(applicationContext).scanFileForGallery(saved)
+                        DebugLog.log(this@ScreenRecorderService, TAG, "Saved: ${saved.absolutePath} (${saved.length()} bytes)")
+                        toast("Video saved: ${saved.parentFile?.name}/${saved.name}")
+                    } else {
+                        toast("Video save korte parlo na. Log dekho: Android/data/$packageName/files/screencraft_log.txt")
                     }
-                } else if (videoFile != finalTarget) {
-                    moveFile(videoFile, finalTarget)
+                } else {
+                    DebugLog.log(this@ScreenRecorderService, TAG, "No video data produced. encoderError=${encoder?.lastError}")
+                    if (finalTarget != null) {
+                        toast("Recording e kono video data paoa jayni: ${encoder?.lastError ?: "unknown"}")
+                    }
+                    videoFile?.delete()
+                    audioFile?.delete()
                 }
-
-                if (!finalTarget.exists() && videoFile.exists() && videoFile.length() > 0) {
-                    moveFile(videoFile, finalTarget)
+            } catch (t: Throwable) {
+                DebugLog.log(this@ScreenRecorderService, TAG, "Stop/save pipeline crashed", t)
+                toast("Save korar somoy error: ${t.message}")
+            } finally {
+                try {
+                    VideoRepository.getInstance(applicationContext).refreshVideos()
+                } catch (_: Throwable) {
                 }
-
-                // Register final file in Android MediaStore so it immediately appears in phone's Gallery
-                if (finalTarget.exists() && finalTarget.length() > 0) {
-                    VideoRepository.getInstance(applicationContext).scanFileForGallery(finalTarget)
-                }
-            } else {
-                // Delete orphaned 0-byte files if any
-                if (videoFile?.exists() == true && videoFile.length() == 0L) {
-                    videoFile.delete()
-                }
-                if (audioFile?.exists() == true) {
-                    audioFile.delete()
-                }
+                _recorderState.value = RecorderState(status = RecorderStatus.IDLE)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             }
-
-            VideoRepository.getInstance(applicationContext).refreshVideos()
-
-            _recorderState.value = RecorderState(status = RecorderStatus.IDLE)
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
         }
+    }
+
+    /**
+     * Turns the raw recorded temp file into the final video and puts it in the public folder.
+     * The raw video is never deleted until a playable replacement exists.
+     * Returns the saved file, or null if it could not be saved anywhere.
+     */
+    private fun finalizeVideo(videoFile: File, audioFile: File?, finalTarget: File, trimSeconds: Int): File? {
+        val workDir = videoFile.parentFile ?: cacheDir
+        val candidate = File(workDir, "processed_${finalTarget.name}")
+        candidate.delete()
+
+        var best: File = videoFile
+        try {
+            val audio = audioFile?.takeIf { it.exists() && it.length() > 0 }
+            val out: File = when {
+                audio != null -> VideoTrimmer.mergeAndTrim(videoFile, audio, candidate, trimSeconds)
+                trimSeconds > 0 -> VideoTrimmer.trimEnd(videoFile, trimSeconds, candidate)
+                else -> videoFile
+            }
+            if (out.exists() && out.length() > 0) {
+                best = out
+            } else if (candidate.exists() && candidate.length() > 0) {
+                best = candidate
+            }
+        } catch (t: Throwable) {
+            DebugLog.log(this, TAG, "Post-processing failed, saving raw video", t)
+        }
+        if (!best.exists() || best.length() == 0L) best = videoFile
+        if (!best.exists() || best.length() == 0L) return null
+
+        var target = finalTarget
+        var moved = moveFile(best, target)
+        if (!moved || !target.exists() || target.length() == 0L) {
+            // Public folder not writable: fall back to the app's own external folder (still listed in the app)
+            val fallbackDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: File(filesDir, "Movies")
+            target = File(fallbackDir, finalTarget.name)
+            DebugLog.log(this, TAG, "Public save failed, falling back to ${target.absolutePath}")
+            moved = moveFile(best, target)
+        }
+        audioFile?.delete()
+        return if (moved && target.exists() && target.length() > 0) target else null
     }
 
     // Releases only recorder-side resources so the MediaProjection can be reused for a retry
     private fun releaseRecorderOnly() {
-        try { virtualDisplay?.release() } catch (_: Exception) {}
+        try { virtualDisplay?.release() } catch (_: Throwable) {}
         virtualDisplay = null
-        try { internalAudioRecorder?.stop() } catch (_: Exception) {}
+        try { internalAudioRecorder?.stop() } catch (_: Throwable) {}
         internalAudioRecorder = null
-        try { mediaRecorder?.reset() } catch (_: Exception) {}
-        try { mediaRecorder?.release() } catch (_: Exception) {}
-        mediaRecorder = null
-        try { outputPfd?.close() } catch (_: Exception) {}
-        outputPfd = null
-        try { tempVideoFile?.delete() } catch (_: Exception) {}
+        try { screenEncoder?.release() } catch (_: Throwable) {}
+        screenEncoder = null
+        try { tempVideoFile?.delete() } catch (_: Throwable) {}
         tempVideoFile = null
-        try { tempAudioFile?.delete() } catch (_: Exception) {}
+        try { tempAudioFile?.delete() } catch (_: Throwable) {}
         tempAudioFile = null
     }
 
@@ -473,41 +446,30 @@ class ScreenRecorderService : Service() {
             src.delete()
             true
         } catch (e: Exception) {
-            Log.e(TAG, "moveFile failed", e)
+            DebugLog.log(this, TAG, "moveFile ${src.absolutePath} -> ${dst.absolutePath} failed", e)
             false
         }
     }
 
     private fun cleanup() {
-        try {
-            virtualDisplay?.release()
-            virtualDisplay = null
-        } catch (_: Exception) {}
+        try { virtualDisplay?.release() } catch (_: Throwable) {}
+        virtualDisplay = null
 
-        try {
-            mediaRecorder?.release()
-            mediaRecorder = null
-        } catch (_: Exception) {}
+        try { screenEncoder?.release() } catch (_: Throwable) {}
+        screenEncoder = null
 
-        try {
-            outputPfd?.close()
-            outputPfd = null
-        } catch (_: Exception) {}
-
-        try {
-            internalAudioRecorder?.stop()
-            internalAudioRecorder = null
-        } catch (_: Exception) {}
+        try { internalAudioRecorder?.stop() } catch (_: Throwable) {}
+        internalAudioRecorder = null
 
         try {
             projectionCallback?.let { mediaProjection?.unregisterCallback(it) }
             projectionCallback = null
-        } catch (_: Exception) {}
+        } catch (_: Throwable) {}
 
         try {
             mediaProjection?.stop()
             mediaProjection = null
-        } catch (_: Exception) {}
+        } catch (_: Throwable) {}
     }
 
     private fun updateNotification(contentText: String) {
@@ -520,9 +482,7 @@ class ScreenRecorderService : Service() {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         val openAppPendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            openAppIntent,
+            this, 0, openAppIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
@@ -530,21 +490,18 @@ class ScreenRecorderService : Service() {
             action = ACTION_STOP
         }
         val stopPendingIntent = PendingIntent.getService(
-            this,
-            1,
-            stopIntent,
+            this, 1, stopIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val builder = NotificationCompat.Builder(this, ScreenCraftApp.NOTIFICATION_CHANNEL_ID)
+        return NotificationCompat.Builder(this, ScreenCraftApp.NOTIFICATION_CHANNEL_ID)
             .setContentTitle(getString(R.string.notification_recording_title))
             .setContentText(contentText)
             .setSmallIcon(R.drawable.ic_qs_record)
             .setOngoing(true)
             .setContentIntent(openAppPendingIntent)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, getString(R.string.notification_action_stop), stopPendingIntent)
-
-        return builder.build()
+            .build()
     }
 
     private fun formatSeconds(seconds: Long): String {
@@ -556,8 +513,11 @@ class ScreenRecorderService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         timerJob?.cancel()
-        cleanup()
-        _recorderState.value = RecorderState(status = RecorderStatus.IDLE)
+        // If we are destroyed mid-recording, the stop pipeline is already running or nothing is active
+        if (_recorderState.value.status != RecorderStatus.STOPPING) {
+            cleanup()
+            _recorderState.value = RecorderState(status = RecorderStatus.IDLE)
+        }
     }
 
     companion object {

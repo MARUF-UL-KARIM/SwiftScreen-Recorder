@@ -13,6 +13,20 @@ object VideoTrimmer {
     private const val TAG = "VideoTrimmer"
     private const val DEFAULT_BUFFER_SIZE = 1024 * 1024 // 1MB buffer
 
+    /** True if the file can be opened and reports a positive duration. */
+    fun isPlayable(file: File): Boolean {
+        if (!file.exists() || file.length() == 0L) return false
+        val r = MediaMetadataRetriever()
+        return try {
+            r.setDataSource(file.absolutePath)
+            (r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L) > 0L
+        } catch (_: Exception) {
+            false
+        } finally {
+            try { r.release() } catch (_: Exception) {}
+        }
+    }
+
     /** renameTo fails across file systems (app cache -> public storage); fall back to copy + delete. */
     private fun safeMove(src: File, dst: File): Boolean {
         return try {
@@ -172,7 +186,14 @@ object VideoTrimmer {
             videoExtractor.release()
             audioExtractor.release()
 
-            // Clean up temporary files
+            // Only throw away the inputs if the merged output is really playable
+            if (!isPlayable(outputFile)) {
+                Log.w(TAG, "Merged output not playable, keeping raw video")
+                outputFile.delete()
+                safeMove(videoFile, outputFile)
+                audioFile.delete()
+                return outputFile
+            }
             videoFile.delete()
             audioFile.delete()
 
@@ -300,7 +321,7 @@ object VideoTrimmer {
             muxer = null
             extractor.release()
 
-            if (targetDest.exists() && targetDest.length() > 0) {
+            if (isPlayable(targetDest)) {
                 sourceFile.delete()
                 return targetDest
             } else {

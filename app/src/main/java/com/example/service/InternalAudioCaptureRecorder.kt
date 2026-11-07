@@ -30,8 +30,12 @@ import kotlin.math.abs
  */
 class InternalAudioCaptureRecorder(
     private val mediaProjection: MediaProjection,
-    private val outputFile: File
+    private val outputFile: File,
+    private val useMicrophone: Boolean = false
 ) {
+    /** While true the PCM data is read and discarded so audio stays aligned with a paused video. */
+    @Volatile var paused = false
+
     private var isRecording = false
     private var recordingThread: Thread? = null
 
@@ -59,7 +63,10 @@ class InternalAudioCaptureRecorder(
             // Setup AudioRecord:
             // 1. Android 10+ (API 29+): Official AudioPlaybackCaptureConfiguration
             // 2. Android 8.1 / 9 (API 27/28): Multi-tier internal submix resolution
-            audioRecord = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            audioRecord = if (useMicrophone) {
+                isDirectInternalSubmix = true
+                AudioRecord(MediaRecorder.AudioSource.MIC, SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT, bufferSize)
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 isDirectInternalSubmix = true
                 val playbackConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
                     .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
@@ -152,7 +159,7 @@ class InternalAudioCaptureRecorder(
 
             while (isRecording) {
                 val readBytes = record.read(pcmBuffer, 0, pcmBuffer.size)
-                if (readBytes > 0) {
+                if (readBytes > 0 && !paused) {
                     // On Android 8.1 fallback, apply Acoustic Noise Gate to block ambient room noise
                     if (!isDirectInternalSubmix) {
                         applyAcousticNoiseGate(pcmBuffer, readBytes)
@@ -257,7 +264,7 @@ class InternalAudioCaptureRecorder(
             audioRecord?.stop()
         } catch (_: Exception) {}
         try {
-            recordingThread?.join(800)
+            recordingThread?.join(3000)
         } catch (_: Exception) {}
         recordingThread = null
         release()

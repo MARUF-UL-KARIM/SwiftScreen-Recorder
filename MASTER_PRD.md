@@ -234,6 +234,12 @@ On Android 8.1 / 9 devices:
 - **Issue 2 (Android 8.1 String Output Path SELinux Block):** In Android 8.1, `MediaRecorder.setOutputFile(path: String)` relies on the native `mediaserver` process to open the destination file. On various vendor ROMs and external storage paths, `mediaserver` lacks file access permissions, leading to 0-byte unwritten output.
   - *Fix:* Upgraded `ScreenRecorderService.kt` to open the destination file directly in the application's own execution context using `ParcelFileDescriptor.open(videoTargetFile, MODE_READ_WRITE or MODE_CREATE)` and pass the open file descriptor via `recorder.setOutputFile(pfd.fileDescriptor)`. The descriptor is safely tracked and closed in `cleanup()`.
 
+### 9.11 Encoder Fallback Retry & Cross-Filesystem safeMove (v1.2.4)
+- **Multi-Tier Resolution/Bitrate Fallback Pipeline:** `ScreenRecorderService.kt` now attempts initialization with 3 progressive encoder configurations (100% full resolution/bitrate -> 75% resolution @ max 30 FPS / 4 Mbps -> 50% resolution @ 24 FPS / 2 Mbps) with 16-pixel alignment (`maxOf(16, ((rawW * scale) / 16) * 16)`). This prevents MediaRecorder crash on legacy Android 8.1 hardware encoders that reject non-standard dimensions.
+- **Isolated Cache Temp Directory:** Temporary video/audio recording buffers are now written directly to `File(cacheDir, "recording_tmp")` rather than public media folders, eliminating partial file clutter during active sessions.
+- **Cross-Filesystem `safeMove` Transfer:** `renameTo()` fails silently when moving files across different mounts (`cacheDir` -> public `/storage/emulated/0/Movies/ScreenCraft`). Implemented `safeMove()` / `moveFile()` fallback in `ScreenRecorderService.kt` and `VideoTrimmer.kt` using `copyTo(dst, overwrite = true)` followed by `src.delete()`.
+- **Stale Temp Cleanup Policy:** `VideoRepository.cleanupOrphanedTempFiles` now enforces a 10-minute age cutoff (`file.lastModified() < System.currentTimeMillis() - 10 * 60 * 1000L`) so recent temporary files in progress are never deleted prematurely.
+
 ---
 
 ## 10. MediaProjection Service & Frame Buffering Architecture (`MediaProjectionFrameService`)

@@ -165,6 +165,9 @@ class ScreenRecorderService : Service() {
                     }
                 }
             } else {
+                cleanup()
+                _recorderState.value = RecorderState(status = RecorderStatus.IDLE)
+                stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
         }
@@ -173,6 +176,29 @@ class ScreenRecorderService : Service() {
     private fun initAndStartRecorder(
         projection: MediaProjection,
         settings: RecordingSettings
+    ): Boolean {
+        // Attempt 1: user settings. Attempt 2/3: safer values for weak Android 8 encoders.
+        val attempts = listOf(
+            Triple(1.0f, settings.fps, settings.bitrateMbps),
+            Triple(0.75f, minOf(settings.fps, 30), minOf(settings.bitrateMbps, 4)),
+            Triple(0.5f, 24, 2)
+        )
+        for ((index, a) in attempts.withIndex()) {
+            if (tryInitAndStartRecorder(projection, settings, a.first, a.second, a.third)) return true
+            if (index < attempts.lastIndex) Log.w(TAG, "Recorder start failed, retrying with safer config #${index + 2}")
+        }
+        Handler(Looper.getMainLooper()).post {
+            android.widget.Toast.makeText(this, "Screen recording start korte parlo na (device encoder issue)", android.widget.Toast.LENGTH_LONG).show()
+        }
+        return false
+    }
+
+    private fun tryInitAndStartRecorder(
+        projection: MediaProjection,
+        settings: RecordingSettings,
+        scale: Float,
+        fpsToUse: Int,
+        bitrateMbpsToUse: Int
     ): Boolean {
         return try {
             val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -185,8 +211,11 @@ class ScreenRecorderService : Service() {
             // Ensure 720x1520 exact dimensions for MATCH_SCREEN and HD_720P on 720x1520 device
             val targetWidth = if (settings.resolution.isMatchScreen && minOf(metrics.widthPixels, metrics.heightPixels) in 700..740) 720 else minOf(baseWidth, baseHeight)
             val targetHeight = if (settings.resolution.isMatchScreen && maxOf(metrics.widthPixels, metrics.heightPixels) in 1500..1540) 1520 else maxOf(baseWidth, baseHeight)
-            val width = if (isPortrait) targetWidth else targetHeight
-            val height = if (isPortrait) targetHeight else targetWidth
+            val rawW = if (isPortrait) targetWidth else targetHeight
+            val rawH = if (isPortrait) targetHeight else targetWidth
+            // Align to multiple of 16 (hardware H.264 encoders on Android 8 are picky)
+            val width = maxOf(16, ((rawW * scale).toInt() / 16) * 16)
+            val height = maxOf(16, ((rawH * scale).toInt() / 16) * 16)
             val dpi = if (metrics.densityDpi > 0) metrics.densityDpi else DisplayMetrics.DENSITY_DEVICE_STABLE
 
             val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -196,11 +225,14 @@ class ScreenRecorderService : Service() {
             currentFinalOutputFile = finalFile
 
             val isInternalAudio = settings.audioMode == AudioMode.INTERNAL_ONLY
-            val isMicAudio = settings.audioMode == AudioMode.INTERNAL_AND_MIC
+            val isMicAudio = settings.audioMode == AudioMode.INTERNAL_AND_MIC &&
+                androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
 
             // When INTERNAL_ONLY is requested: STRICTLY DO NOT TOUCH MICROPHONE!
             // Video and internal audio are captured via dedicated pure digital pipeline
-            val videoTargetFile = File(recordingsDir, "temp_video_$timeStamp.mp4")
+            val tempDir = File(cacheDir, "recording_tmp").apply { mkdirs() }
+            val videoTargetFile = File(tempDir, "temp_video_$timeStamp.mp4")
             tempVideoFile = videoTargetFile
 
             // Ensure parent directory exists and File object is cleanly initialized before starting MediaRecorder
@@ -247,8 +279,8 @@ class ScreenRecorderService : Service() {
             }
 
             recorder.setVideoSize(width, height)
-            recorder.setVideoFrameRate(settings.fps)
-            recorder.setVideoEncodingBitRate(settings.bitrateMbps * 1000 * 1000)
+            recorder.setVideoFrameRate(fpsToUse)
+            recorder.setVideoEncodingBitRate(bitrateMbpsToUse * 1000 * 1000)
 
             val pfd = android.os.ParcelFileDescriptor.open(
                 videoTargetFile,
@@ -264,7 +296,7 @@ class ScreenRecorderService : Service() {
 
             // 2. Start pure digital internal audio capture (ZERO microphone hardware)
             if (isInternalAudio) {
-                val audioFile = File(recordingsDir, "temp_audio_$timeStamp.m4a")
+                val audioFile = File(tempDir, "temp_audio_$timeStamp.m4a")
                 tempAudioFile = audioFile
                 val internalRecorder = InternalAudioCaptureRecorder(projection, audioFile)
                 val started = internalRecorder.start()
@@ -277,10 +309,7 @@ class ScreenRecorderService : Service() {
                 }
             }
 
-            // 3. Start MediaRecorder FIRST so surface receiver is actively consuming frames
-            recorder.start()
-
-            // 4. Create VirtualDisplay attached to the actively recording surface
+            // 3. Create VirtualDisplay on the recorder surface, THEN start the recorder (standard, Android 8 safe order)
             virtualDisplay = projection.createVirtualDisplay(
                 "ScreenCraftDisplay",
                 width,
@@ -291,11 +320,11 @@ class ScreenRecorderService : Service() {
                 null,
                 null
             )
+            recorder.start()
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start screen recording", e)
-            cleanup()
-            _recorderState.value = RecorderState(status = RecorderStatus.IDLE)
+            releaseRecorderOnly()
             false
         }
     }
@@ -328,6 +357,7 @@ class ScreenRecorderService : Service() {
     }
 
     private fun stopRecording() {
+        if (_recorderState.value.status == RecorderStatus.STOPPING) return
         timerJob?.cancel()
         _recorderState.value = RecorderState(status = RecorderStatus.STOPPING)
         updateNotification("Saving & Processing video...")
@@ -382,17 +412,17 @@ class ScreenRecorderService : Service() {
                     val trimmed = VideoTrimmer.trimEnd(videoFile, trimSeconds, finalTarget)
                     if (!finalTarget.exists() || finalTarget.length() == 0L) {
                         if (trimmed.exists() && trimmed.length() > 0) {
-                            trimmed.renameTo(finalTarget)
+                            moveFile(trimmed, finalTarget)
                         } else if (videoFile.exists() && videoFile.length() > 0) {
-                            videoFile.renameTo(finalTarget)
+                            moveFile(videoFile, finalTarget)
                         }
                     }
                 } else if (videoFile != finalTarget) {
-                    videoFile.renameTo(finalTarget)
+                    moveFile(videoFile, finalTarget)
                 }
 
                 if (!finalTarget.exists() && videoFile.exists() && videoFile.length() > 0) {
-                    videoFile.renameTo(finalTarget)
+                    moveFile(videoFile, finalTarget)
                 }
 
                 // Register final file in Android MediaStore so it immediately appears in phone's Gallery
@@ -414,6 +444,37 @@ class ScreenRecorderService : Service() {
             _recorderState.value = RecorderState(status = RecorderStatus.IDLE)
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
+        }
+    }
+
+    // Releases only recorder-side resources so the MediaProjection can be reused for a retry
+    private fun releaseRecorderOnly() {
+        try { virtualDisplay?.release() } catch (_: Exception) {}
+        virtualDisplay = null
+        try { internalAudioRecorder?.stop() } catch (_: Exception) {}
+        internalAudioRecorder = null
+        try { mediaRecorder?.reset() } catch (_: Exception) {}
+        try { mediaRecorder?.release() } catch (_: Exception) {}
+        mediaRecorder = null
+        try { outputPfd?.close() } catch (_: Exception) {}
+        outputPfd = null
+        try { tempVideoFile?.delete() } catch (_: Exception) {}
+        tempVideoFile = null
+        try { tempAudioFile?.delete() } catch (_: Exception) {}
+        tempAudioFile = null
+    }
+
+    // renameTo fails between cache dir and public storage, so copy+delete when needed
+    private fun moveFile(src: File, dst: File): Boolean {
+        return try {
+            dst.parentFile?.mkdirs()
+            if (src.renameTo(dst)) return true
+            src.copyTo(dst, overwrite = true)
+            src.delete()
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "moveFile failed", e)
+            false
         }
     }
 

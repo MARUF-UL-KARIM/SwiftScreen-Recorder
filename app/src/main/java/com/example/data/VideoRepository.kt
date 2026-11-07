@@ -71,15 +71,12 @@ class VideoRepository(private val context: Context) {
     private fun cleanupOrphanedTempFiles(dir: File) {
         val st = com.example.service.ScreenRecorderService.recorderState.value.status
         if (st != com.example.service.RecorderStatus.IDLE) return
+        // Only remove stale leftovers (older than 10 minutes). Never touch a file that may still be written.
+        val cutoff = System.currentTimeMillis() - 10 * 60 * 1000L
         try {
             dir.listFiles()?.forEach { file ->
-                if (file.isFile) {
-                    val isTemp = file.name.startsWith("temp_")
-                    val isZeroByte = file.length() == 0L
-                    val isAudioTemp = file.extension.lowercase() == "m4a" && file.name.startsWith("temp_")
-                    if (isTemp || isZeroByte || isAudioTemp) {
-                        file.delete()
-                    }
+                if (file.isFile && file.name.startsWith("temp_") && file.lastModified() < cutoff) {
+                    file.delete()
                 }
             }
         } catch (_: Exception) {}

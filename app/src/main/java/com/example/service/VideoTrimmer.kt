@@ -13,6 +13,20 @@ object VideoTrimmer {
     private const val TAG = "VideoTrimmer"
     private const val DEFAULT_BUFFER_SIZE = 1024 * 1024 // 1MB buffer
 
+    /** renameTo fails across file systems (app cache -> public storage); fall back to copy + delete. */
+    private fun safeMove(src: File, dst: File): Boolean {
+        return try {
+            dst.parentFile?.mkdirs()
+            if (src.renameTo(dst)) return true
+            src.copyTo(dst, overwrite = true)
+            src.delete()
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "safeMove failed", e)
+            false
+        }
+    }
+
     /**
      * Merges [videoFile] and optional [audioFile] (internal audio) into [outputFile],
      * while simultaneously trimming [trimSeconds] off the end of the recording.
@@ -175,7 +189,7 @@ object VideoTrimmer {
                 outputFile.delete()
             }
             if (videoFile.exists()) {
-                videoFile.renameTo(outputFile)
+                safeMove(videoFile, outputFile)
             }
             if (audioFile?.exists() == true) {
                 audioFile.delete()
@@ -191,7 +205,7 @@ object VideoTrimmer {
         if (!sourceFile.exists() || trimSeconds <= 0) {
             if (destinationFile != null && destinationFile != sourceFile) {
                 if (destinationFile.exists()) destinationFile.delete()
-                sourceFile.renameTo(destinationFile)
+                safeMove(sourceFile, destinationFile)
                 return destinationFile
             }
             return sourceFile
@@ -217,7 +231,7 @@ object VideoTrimmer {
         if (targetEndUs <= 1_000_000L) {
             Log.w(TAG, "Video duration too short to trim. Keeping original.")
             if (destinationFile != null && destinationFile != sourceFile) {
-                sourceFile.renameTo(destinationFile)
+                safeMove(sourceFile, destinationFile)
                 return destinationFile
             }
             return sourceFile

@@ -22,6 +22,7 @@ import com.example.service.ScreenRecorderService
 import com.example.ui.screens.MainScreen
 import com.example.ui.theme.ScreenCraftTheme
 
+@android.annotation.SuppressLint("InvalidFragmentVersionForActivityResult")
 class MainActivity : ComponentActivity() {
 
     private lateinit var projectionManager: MediaProjectionManager

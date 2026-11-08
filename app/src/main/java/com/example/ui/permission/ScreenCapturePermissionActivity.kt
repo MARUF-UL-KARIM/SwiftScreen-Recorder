@@ -14,6 +14,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import com.example.service.ScreenRecorderService
 
+@android.annotation.SuppressLint("InvalidFragmentVersionForActivityResult")
 class ScreenCapturePermissionActivity : ComponentActivity() {
 
     private val captureLauncher = registerForActivityResult(

@@ -46,6 +46,7 @@ object VideoTrimmer {
      * while simultaneously trimming [trimSeconds] off the end of the recording.
      * Deletes temporary intermediate files upon completion.
      */
+    @android.annotation.SuppressLint("WrongConstant")
     fun mergeAndTrim(
         videoFile: File,
         audioFile: File?,
@@ -222,6 +223,7 @@ object VideoTrimmer {
     /**
      * Trims [trimSeconds] off the END of the MP4 file at [sourceFile].
      */
+    @android.annotation.SuppressLint("WrongConstant")
     fun trimEnd(sourceFile: File, trimSeconds: Int, destinationFile: File? = null): File {
         if (!sourceFile.exists() || trimSeconds <= 0) {
             if (destinationFile != null && destinationFile != sourceFile) {

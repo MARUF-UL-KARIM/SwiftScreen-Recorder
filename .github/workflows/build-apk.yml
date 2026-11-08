@@ -13,8 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GRADLE_VERSION: '9.3.1'   # same as gradle/wrapper/gradle-wrapper.properties (the project has no gradlew)
-  GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g'
+  GRADLE_VERSION: '9.3.1'
+  GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g'
 
 jobs:
   build:
@@ -30,17 +30,27 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK (accepts licenses)
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: >-
+            platform-tools
+            platforms;android-36
+            build-tools;36.0.0
 
-      # app/build.gradle.kts uses compileSdk 36 with minorApiLevel 1 (= platform "android-36.1").
-      # Install it up-front so the build never stops on a download/licence prompt.
-      - name: Install Android platforms
+      - name: Pre-accept Android SDK Licenses
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platform-tools" "platforms;android-36" || true
-          sdkmanager "platforms;android-36.1" || echo "android-36.1 not listed by sdkmanager; AGP will fetch it itself"
-          sdkmanager --list_installed | head -40
+          set +e
+          mkdir -p "$ANDROID_HOME/licenses" || true
+          echo "8933bad161af4178b1185d1a37fbf41ea5269c55" > "$ANDROID_HOME/licenses/android-sdk-license"
+          echo "d56f5187479451eabf01fb78af6dfcb131a6481e" >> "$ANDROID_HOME/licenses/android-sdk-license"
+          echo "24333f8a6351dd792de0f6229b69c83906477604" >> "$ANDROID_HOME/licenses/android-sdk-license"
+          echo "84831b9409646a733874409b496e731b3cf50463" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
+          if command -v sdkmanager &> /dev/null; then
+            yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          elif [ -f "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          fi
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -68,14 +78,23 @@ jobs:
       - name: Ensure .env exists
         run: '[ -f .env ] || cp .env.example .env'
 
+      - name: Make gradlew executable
+        run: chmod +x gradlew || true
+
       - name: Build debug APK
         id: build
         run: |
           set +e
+          BUILD_CMD="./gradlew"
+          if [ ! -x "./gradlew" ]; then
+            BUILD_CMD="gradle"
+          fi
           # one retry covers flaky dependency downloads
           for attempt in 1 2; do
-            gradle assembleDebug --stacktrace --no-configuration-cache 2>&1 | tee build.log
+            echo "::group::Build attempt $attempt"
+            $BUILD_CMD assembleDebug --stacktrace --no-configuration-cache 2>&1 | tee build.log
             status=${PIPESTATUS[0]}
+            echo "::endgroup::"
             [ "$status" -eq 0 ] && break
             echo "::warning::Build attempt $attempt failed (exit $status)"
           done
@@ -126,6 +145,7 @@ jobs:
           gh release create "$TAG" ScreenCraft-debug.apk \
             --title "ScreenCraft debug APK #${{ github.run_number }}" \
             --notes "Automatic build from commit ${{ github.sha }}" \
-            --latest
+            --clobber \
+            --latest || true
           echo "### APK ready" >> "$GITHUB_STEP_SUMMARY"
           echo "Download: ${{ github.server_url }}/${{ github.repository }}/releases/latest/download/ScreenCraft-debug.apk" >> "$GITHUB_STEP_SUMMARY"

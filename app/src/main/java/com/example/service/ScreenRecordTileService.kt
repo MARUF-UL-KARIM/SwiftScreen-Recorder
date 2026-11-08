@@ -76,6 +76,7 @@ class ScreenRecordTileService : TileService() {
                     startActivityAndCollapse(pendingIntent)
                 } else {
                     @Suppress("DEPRECATION")
+                    @android.annotation.SuppressLint("StartActivityAndCollapseDeprecated")
                     startActivityAndCollapse(permIntent)
                 }
             }

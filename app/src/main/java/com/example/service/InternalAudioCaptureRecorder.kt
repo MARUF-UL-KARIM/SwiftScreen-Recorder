@@ -15,16 +15,16 @@ import android.os.Build
 import android.util.Log
 import java.io.File
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.abs
 
 /**
- * Captures high-quality internal device playback audio (games, music, videos, apps).
+ * Captures high-quality internal device playback audio (games, music, videos, apps)
+ * with optional simultaneous microphone voice commentary mixing.
  *
- * - On Android 10+ (API 29+): Uses native AudioPlaybackCaptureConfiguration directly
- *   capturing the system digital stream with zero microphone usage.
- * - On Android 8.1+ (API 27/28): Uses multi-tier internal submix resolution (REMOTE_SUBMIX,
- *   UNPROCESSED, VOICE_RECOGNITION) combined with a real-time DSP Acoustic Noise Gate
- *   to suppress ambient/environmental noise, isolating clear in-app sound.
+ * - In INTERNAL_ONLY mode: captures crisp internal app/game sound without environmental noise.
+ * - In INTERNAL_AND_MIC mode: simultaneously captures internal audio (even with AirPods connected!)
+ *   AND microphone voice commentary, mixing them together in real-time.
  *
  * Encodes directly into high-fidelity AAC (48kHz, Stereo, 192 kbps).
  */
@@ -38,8 +38,14 @@ class InternalAudioCaptureRecorder(
 
     private var isRecording = false
     private var recordingThread: Thread? = null
+    private var micThread: Thread? = null
 
-    private var audioRecord: AudioRecord? = null
+    private var internalAudioRecord: AudioRecord? = null
+    private var micAudioRecord: AudioRecord? = null
+    private val micQueue = ConcurrentLinkedQueue<ByteArray>()
+    private var micResidual: ByteArray? = null
+    private var micResidualOffset = 0
+
     private var mediaCodec: MediaCodec? = null
     private var mediaMuxer: MediaMuxer? = null
     private var audioTrackIndex = -1
@@ -60,37 +66,66 @@ class InternalAudioCaptureRecorder(
             val minBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
             val bufferSize = maxOf(minBufferSize * 2, 8192)
 
-            // Setup AudioRecord:
-            // 1. Android 10+ (API 29+): Official AudioPlaybackCaptureConfiguration
-            // 2. Android 8.1 / 9 (API 27/28): Multi-tier internal submix resolution
-            audioRecord = if (useMicrophone) {
+            // 1. Setup Internal System Audio Capture:
+            // Intercepts the digital audio stream (games, music, videos) playing to speakers or AirPods
+            internalAudioRecord = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 isDirectInternalSubmix = true
-                AudioRecord(MediaRecorder.AudioSource.MIC, SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT, bufferSize)
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                isDirectInternalSubmix = true
-                val playbackConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
-                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                    .build()
+                try {
+                    val playbackConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
+                        .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                        .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                        .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                        .build()
 
-                AudioRecord.Builder()
-                    .setAudioPlaybackCaptureConfig(playbackConfig)
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(AUDIO_FORMAT)
-                            .setSampleRate(SAMPLE_RATE)
-                            .setChannelMask(CHANNEL_CONFIG)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(bufferSize)
-                    .build()
+                    AudioRecord.Builder()
+                        .setAudioPlaybackCaptureConfig(playbackConfig)
+                        .setAudioFormat(
+                            AudioFormat.Builder()
+                                .setEncoding(AUDIO_FORMAT)
+                                .setSampleRate(SAMPLE_RATE)
+                                .setChannelMask(CHANNEL_CONFIG)
+                                .build()
+                        )
+                        .setBufferSizeInBytes(bufferSize)
+                        .build()
+                } catch (e: Exception) {
+                    Log.w(TAG, "AudioPlaybackCaptureConfiguration failed: ${e.message}")
+                    null
+                }
             } else {
                 createAudioRecordForAndroid8(bufferSize)
             }
 
-            if (audioRecord == null || audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                Log.w(TAG, "AudioRecord could not be initialized for internal capture")
+            if (internalAudioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                internalAudioRecord?.release()
+                internalAudioRecord = null
+            }
+
+            // 2. Setup Microphone Audio Capture (for Internal + Mic commentary mode):
+            if (useMicrophone) {
+                try {
+                    val micRec = AudioRecord(
+                        MediaRecorder.AudioSource.MIC,
+                        SAMPLE_RATE,
+                        CHANNEL_CONFIG,
+                        AUDIO_FORMAT,
+                        bufferSize
+                    )
+                    if (micRec.state == AudioRecord.STATE_INITIALIZED) {
+                        micAudioRecord = micRec
+                        Log.d(TAG, "Microphone AudioRecord initialized for commentary")
+                    } else {
+                        micRec.release()
+                        Log.w(TAG, "Microphone AudioRecord failed to initialize")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error initializing microphone AudioRecord: ${e.message}")
+                }
+            }
+
+            // Must have at least one active audio source
+            if (internalAudioRecord == null && micAudioRecord == null) {
+                Log.w(TAG, "Neither internal audio nor microphone could be initialized")
                 release()
                 return false
             }
@@ -110,17 +145,42 @@ class InternalAudioCaptureRecorder(
             mediaMuxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
             isRecording = true
-            audioRecord?.startRecording()
+
+            // Start AudioRecord instances
+            try { internalAudioRecord?.startRecording() } catch (e: Exception) { Log.e(TAG, "internalAudioRecord start failed", e) }
+            try { micAudioRecord?.startRecording() } catch (e: Exception) { Log.e(TAG, "micAudioRecord start failed", e) }
+
+            // If mic is active and we also have internal audio, start dedicated non-blocking mic reader thread
+            val activeMic = micAudioRecord
+            if (activeMic != null && internalAudioRecord != null) {
+                micThread = Thread({
+                    val micBuffer = ByteArray(bufferSize)
+                    while (isRecording) {
+                        val read = activeMic.read(micBuffer, 0, micBuffer.size)
+                        if (read > 0 && !paused) {
+                            val chunk = ByteArray(read)
+                            System.arraycopy(micBuffer, 0, chunk, 0, read)
+                            micQueue.offer(chunk)
+                            while (micQueue.size > 12) {
+                                micQueue.poll()
+                            }
+                        }
+                    }
+                }, "MicAudioRecordThread").apply {
+                    priority = Thread.NORM_PRIORITY
+                    start()
+                }
+            }
 
             recordingThread = Thread({ recordAndEncodeLoop(bufferSize) }, "InternalAudioRecordThread").apply {
                 priority = Thread.MAX_PRIORITY
                 start()
             }
 
-            Log.d(TAG, "Internal audio recording started (48kHz Stereo 192kbps, directSubmix=$isDirectInternalSubmix)")
+            Log.d(TAG, "Audio recording started (hasInternal=${internalAudioRecord != null}, hasMic=${micAudioRecord != null}, directSubmix=$isDirectInternalSubmix)")
             return true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start internal audio capture", e)
+            Log.e(TAG, "Failed to start audio capture", e)
             release()
             return false
         }
@@ -142,22 +202,28 @@ class InternalAudioCaptureRecorder(
         }
 
         // Step 2: Smart Android 8.1 Device Sound Isolation Trick
-        // Instead of returning null and leaving the video completely silent,
-        // use hardware directional/unprocessed sources with real-time DSP Voice & Noise Suppressor
-        // to isolate internal speaker/earphone playback and heavily suppress room voice & fan noise.
-        val candidateSources = intArrayOf(
-            MediaRecorder.AudioSource.VOICE_RECOGNITION, // Hardware DSP focuses on clear audio & rejects room noise
-            MediaRecorder.AudioSource.CAMCORDER,        // Focused audio pickup
-            MediaRecorder.AudioSource.DEFAULT,
-            MediaRecorder.AudioSource.MIC
-        )
+        // If pure submix is restricted, use hardware directional/unprocessed sources
+        // Note: If useMicrophone is true, we only bind if the source is not conflicting with mic
+        val candidateSources = if (useMicrophone) {
+            intArrayOf(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.CAMCORDER
+            )
+        } else {
+            intArrayOf(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.CAMCORDER,
+                MediaRecorder.AudioSource.DEFAULT,
+                MediaRecorder.AudioSource.MIC
+            )
+        }
 
         for (source in candidateSources) {
             try {
                 val rec = AudioRecord(source, SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT, bufferSize)
                 if (rec.state == AudioRecord.STATE_INITIALIZED) {
                     Log.d(TAG, "Android 8.1 Smart Audio Trick: Using source $source with DSP Noise Gate & Voice Suppressor")
-                    isDirectInternalSubmix = false // Will apply real-time DSP Voice & Noise Gate
+                    isDirectInternalSubmix = false
                     return rec
                 }
                 rec.release()
@@ -173,8 +239,12 @@ class InternalAudioCaptureRecorder(
 
     private fun recordAndEncodeLoop(bufferSize: Int) {
         val codec = mediaCodec ?: return
-        val record = audioRecord ?: return
-        val pcmBuffer = ByteArray(bufferSize)
+        val internalRec = internalAudioRecord
+        val micRec = micAudioRecord
+
+        val internalPcm = ByteArray(bufferSize)
+        val micPcm = ByteArray(bufferSize)
+        val mixedPcm = ByteArray(bufferSize)
         val bufferInfo = MediaCodec.BufferInfo()
         var muxerStarted = false
 
@@ -182,20 +252,44 @@ class InternalAudioCaptureRecorder(
             var totalPcmBytesRead = 0L
 
             while (isRecording) {
-                val readBytes = record.read(pcmBuffer, 0, pcmBuffer.size)
+                var readBytes = 0
+
+                if (internalRec != null && micRec != null) {
+                    // Both Internal Audio & Mic are active: read internal (master clock) and mix mic
+                    val internalBytes = internalRec.read(internalPcm, 0, internalPcm.size)
+                    if (internalBytes > 0) {
+                        readBytes = internalBytes
+                        val micBytes = readMicBytes(micPcm, internalBytes)
+                        if (micBytes > 0) {
+                            mixPcmBuffers(internalPcm, micPcm, mixedPcm, minOf(internalBytes, micBytes))
+                            if (internalBytes > micBytes) {
+                                System.arraycopy(internalPcm, micBytes, mixedPcm, micBytes, internalBytes - micBytes)
+                            }
+                        } else {
+                            System.arraycopy(internalPcm, 0, mixedPcm, 0, internalBytes)
+                        }
+                    }
+                } else if (internalRec != null) {
+                    // Internal audio only
+                    val b = internalRec.read(mixedPcm, 0, mixedPcm.size)
+                    if (b > 0) readBytes = b
+                } else if (micRec != null) {
+                    // Microphone only
+                    val b = micRec.read(mixedPcm, 0, mixedPcm.size)
+                    if (b > 0) readBytes = b
+                }
+
                 if (readBytes > 0 && !paused) {
-                    // On Android 8.1 fallback, apply Acoustic Noise Gate to block ambient room noise
-                    if (!isDirectInternalSubmix) {
-                        applyAcousticNoiseGate(pcmBuffer, readBytes)
+                    // If in Internal Audio Only mode with acoustic fallback, apply noise gate
+                    if (!isDirectInternalSubmix && micRec == null) {
+                        applyAcousticNoiseGate(mixedPcm, readBytes)
                     }
 
-                    // Feed raw PCM internal audio into AAC encoder with synchronized timestamps starting at 0
                     val inputIndex = codec.dequeueInputBuffer(10000)
                     if (inputIndex >= 0) {
                         val inputBuffer = codec.getInputBuffer(inputIndex)
                         inputBuffer?.clear()
-                        inputBuffer?.put(pcmBuffer, 0, readBytes)
-                        // 16-bit Stereo PCM: 2 bytes * 2 channels = 4 bytes per frame
+                        inputBuffer?.put(mixedPcm, 0, readBytes)
                         val presentationTimeUs = (totalPcmBytesRead * 1_000_000L) / (SAMPLE_RATE * 4L)
                         totalPcmBytesRead += readBytes
                         codec.queueInputBuffer(inputIndex, 0, readBytes, presentationTimeUs, 0)
@@ -268,6 +362,42 @@ class InternalAudioCaptureRecorder(
         }
     }
 
+    private fun readMicBytes(dest: ByteArray, needed: Int): Int {
+        var filled = 0
+        while (filled < needed) {
+            val curr = micResidual
+            if (curr != null) {
+                val available = curr.size - micResidualOffset
+                val toCopy = minOf(available, needed - filled)
+                System.arraycopy(curr, micResidualOffset, dest, filled, toCopy)
+                filled += toCopy
+                micResidualOffset += toCopy
+                if (micResidualOffset >= curr.size) {
+                    micResidual = null
+                    micResidualOffset = 0
+                }
+            } else {
+                val next = micQueue.poll() ?: break
+                micResidual = next
+                micResidualOffset = 0
+            }
+        }
+        return filled
+    }
+
+    private fun mixPcmBuffers(srcInternal: ByteArray, srcMic: ByteArray, dstMixed: ByteArray, length: Int) {
+        for (i in 0 until length - 1 step 2) {
+            val sampleInternal = ((srcInternal[i + 1].toInt() shl 8) or (srcInternal[i].toInt() and 0xFF)).toShort()
+            val sampleMic = ((srcMic[i + 1].toInt() shl 8) or (srcMic[i].toInt() and 0xFF)).toShort()
+
+            // Mix: 100% internal phone audio + 90% mic commentary, clamped to 16-bit range
+            val mixed = (sampleInternal.toInt() + (sampleMic.toInt() * 0.9f).toInt()).coerceIn(-32768, 32767).toShort()
+
+            dstMixed[i] = (mixed.toInt() and 0xFF).toByte()
+            dstMixed[i + 1] = ((mixed.toInt() shr 8) and 0xFF).toByte()
+        }
+    }
+
     /**
      * Digital Acoustic Isolation & Noise Gate for Android 8.1:
      * - Suppresses low-level room noise, fan hiss, and breathing below NOISE_GATE_THRESHOLD.
@@ -294,12 +424,11 @@ class InternalAudioCaptureRecorder(
 
     fun stop() {
         isRecording = false
-        try {
-            audioRecord?.stop()
-        } catch (_: Exception) {}
-        try {
-            recordingThread?.join(3000)
-        } catch (_: Exception) {}
+        try { internalAudioRecord?.stop() } catch (_: Exception) {}
+        try { micAudioRecord?.stop() } catch (_: Exception) {}
+        try { micThread?.join(2000) } catch (_: Exception) {}
+        micThread = null
+        try { recordingThread?.join(3000) } catch (_: Exception) {}
         recordingThread = null
         release()
 
@@ -310,10 +439,19 @@ class InternalAudioCaptureRecorder(
 
     private fun release() {
         try {
-            audioRecord?.stop()
-            audioRecord?.release()
+            internalAudioRecord?.stop()
+            internalAudioRecord?.release()
         } catch (_: Exception) {}
-        audioRecord = null
+        internalAudioRecord = null
+
+        try {
+            micAudioRecord?.stop()
+            micAudioRecord?.release()
+        } catch (_: Exception) {}
+        micAudioRecord = null
+
+        micQueue.clear()
+        micResidual = null
 
         try {
             mediaCodec?.stop()

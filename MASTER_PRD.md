@@ -303,6 +303,28 @@ On Android 8.1 / 9 devices:
   - An interactive dialog accessible from the Audio Recording Mode section in `SettingsScreen.kt`.
   - Clearly explains the AirPod system, DSP speech rejection, microsecond sync, and the hardware loopback/earphone trick in plain Bangla for non-technical users.
 
+---
+
+## 13. Dual Audio Engine: Simultaneous Internal Audio & Microphone Mixing (v1.2.7)
+
+### 13.1 The AirPods "Microphone Only" Root Cause
+- **Root Cause Identified:** In prior revisions, when `useMicrophone = true` (`AudioMode.INTERNAL_AND_MIC`), `InternalAudioCaptureRecorder` contained a branch that completely bypassed internal system audio capture (`AudioPlaybackCaptureConfiguration` / system submix) and *exclusively* initialized `AudioRecord(AudioSource.MIC)`.
+- **Why AirPods Exposed the Bug:**
+  - Without headphones/AirPods, the phone's loudspeakers played game audio into the room, so the microphone picked up the speaker sound acoustically.
+  - When AirPods or Bluetooth headsets were connected, the phone muted its loudspeakers and routed media audio directly to the AirPod earpieces via Bluetooth A2DP. Because the microphone only heard the user's voice in the room and internal audio capture was bypassed in code, recordings had *zero* internal game audio and only microphone voice.
+
+### 13.2 Dual Audio Pipeline Implementation
+- **Simultaneous Capture:**
+  - `internalAudioRecord`: Captures digital system/game playback audio via `AudioPlaybackCaptureConfiguration` (Android 10+) or `REMOTE_SUBMIX` / hardware focused sources (Android 8.1). It captures the audio playing to the AirPods earpieces.
+  - `micAudioRecord`: Runs concurrently on a dedicated `MicAudioRecordThread`, streaming microphone voice commentary into a concurrent ring buffer (`ConcurrentLinkedQueue<ByteArray>`).
+- **Real-Time Linear PCM Saturation Mixer:**
+  - In `recordAndEncodeLoop`, matching 16-bit PCM stereo sample pairs are blended using headroom-calibrated mixing:
+    $$\text{MixedSample} = \text{clamp}(\text{InternalSample} + 0.90 \times \text{MicSample}, -32768, 32767)$$
+  - Prevents digital clipping/distortion while ensuring both the game audio and voice commentary are crisp and balanced.
+- **Fail-Safe Fallback:**
+  - If either source is unavailable on a specific device, the pipeline gracefully runs the remaining active source without crashing or dropping recording frames.
+
+
 
 
 

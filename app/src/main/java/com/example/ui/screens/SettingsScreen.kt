@@ -43,7 +43,13 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material.icons.filled.Headphones
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -56,6 +62,7 @@ import androidx.compose.ui.unit.sp
 import com.example.model.AudioMode
 import com.example.model.RecordingSettings
 import com.example.model.ResolutionOption
+import com.example.ui.components.Android8AudioGuideDialog
 import com.example.ui.theme.AccentSuccess
 import com.example.ui.theme.StudioBlue
 import com.example.ui.theme.StudioRed
@@ -67,6 +74,11 @@ fun SettingsScreen(
     onSettingsChanged: (RecordingSettings) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    var showAudioGuide by remember { mutableStateOf(false) }
+
+    if (showAudioGuide) {
+        Android8AudioGuideDialog(onDismiss = { showAudioGuide = false })
+    }
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
@@ -275,6 +287,27 @@ fun SettingsScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 fontSize = 12.sp
                             )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            TextButton(
+                                onClick = { showAudioGuide = true },
+                                modifier = Modifier
+                                    .align(Alignment.End)
+                                    .testTag("open_audio_guide_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Headphones,
+                                    contentDescription = null,
+                                    tint = StudioBlue,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "ইন্টারনাল অডিও ও এয়ারপড ট্রিকস গাইড",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = StudioBlue,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
                         }
                     }
                 }

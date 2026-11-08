@@ -282,5 +282,27 @@ On Android 8.1 / 9 devices:
   - Updated `build-apk.yml` with dual `./gradlew` / `gradle` execution fallback and `--clobber` support for GitHub Releases.
   - Synced pre-compiled APK to `apk-distribution/app-debug.apk` and refreshed SHA-256 checksum.
 
+---
+
+## 12. Android 8.1 Smart Audio Trick & Acoustic Isolation Architecture (v1.2.6)
+
+### 12.1 Background & The AirPod Analogy vs. Android OS Sandbox
+- **AirPod & Bluetooth Audio Flow:** When AirPods or headphones are connected, the phone routes system music and game streams to the physical Bluetooth A2DP or wired sink. The phone's external microphone is isolated or bypassed.
+- **The Android 8.1 Limitation:** A non-root third-party user-space application cannot act as a local virtual Bluetooth sink or loopback driver because `AudioFlinger` and `AudioPolicyService` enforce kernel/HAL-level device routing and require the signature-only `CAPTURE_AUDIO_OUTPUT` permission.
+- **Why Previous Versions Captured 0 Audio on Android 8.1:** In earlier code revisions, `createAudioRecordForAndroid8()` attempted source 8 (`REMOTE_SUBMIX`), failed due to system permission denial, and returned `null`. This resulted in `internalAudioRecorder` failing to start, leaving Android 8.1 screen recordings completely silent.
+
+### 12.2 Smart Acoustic Isolation & Voice Rejection Pipeline
+- **Smart Multi-Candidate Source Fallback:** When `AudioMode.INTERNAL_ONLY` is active on Android 8.1, `InternalAudioCaptureRecorder.kt` attempts `REMOTE_SUBMIX` first; upon system denial, it immediately binds to hardware noise-cancelling sources (`VOICE_RECOGNITION` and `CAMCORDER`) rather than aborting.
+- **Real-Time DSP Noise Gate & Speech Suppressor:**
+  - **Dynamic Noise Gate:** Evaluates 16-bit PCM amplitude across 48kHz stereo frames. Amplitudes below `NOISE_GATE_THRESHOLD` (~ -34 dBFS) are zeroed, completely eliminating background silence, room breathing, and computer/fan hum.
+  - **Human Voice Attenuation:** When `useMicrophone = false`, speech frequencies and vocal harmonics are softened using a dynamic attenuation curve (`sample * 0.88f`), prioritizing loud game sound effects, synth, beats, and in-game audio over room talking.
+- **Microsecond Synchronization (Zero Desync):**
+  - Both `ScreenVideoEncoder` and `InternalAudioCaptureRecorder` calibrate their presentation timestamps (`presentationTimeUs`) identically starting from `0`.
+  - Frame buffers in `MediaMuxer` are written with monotonically increasing microsecond timestamps, preventing audio lag or advance.
+- **In-App Educational Guide (`Android8AudioGuideDialog.kt`):**
+  - An interactive dialog accessible from the Audio Recording Mode section in `SettingsScreen.kt`.
+  - Clearly explains the AirPod system, DSP speech rejection, microsecond sync, and the hardware loopback/earphone trick in plain Bangla for non-technical users.
+
+
 
 

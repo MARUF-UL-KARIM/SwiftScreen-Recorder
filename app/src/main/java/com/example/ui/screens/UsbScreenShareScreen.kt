@@ -172,7 +172,7 @@ fun UsbScreenShareScreen(
                                 horizontalArrangement = Arrangement.SpaceAround
                             ) {
                                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                    Text("FPS", style = MaterialTheme.typography.labelSmall, color = StudioBlue)
+                                    Text("FPS (live ${shareState.liveFps})", style = MaterialTheme.typography.labelSmall, color = StudioBlue)
                                     Text(
                                         text = "${shareState.currentFps}",
                                         style = MaterialTheme.typography.titleMedium,

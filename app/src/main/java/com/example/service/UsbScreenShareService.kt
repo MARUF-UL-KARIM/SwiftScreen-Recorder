@@ -8,7 +8,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
@@ -21,6 +23,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
@@ -36,6 +39,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.io.ByteArrayOutputStream
 import java.net.NetworkInterface
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Foreground service managing real-time screen capture and HTTP MJPEG streaming over USB.
@@ -55,10 +59,23 @@ class UsbScreenShareService : Service() {
 
     private var reusableBitmap: Bitmap? = null
     private var croppedBitmap: Bitmap? = null
+    private var cropCanvas: Canvas? = null
+    private val cropSrc = Rect()
+    private val cropDst = Rect()
     private val baos = ByteArrayOutputStream(64 * 1024)
 
-    private var frameCount = 0
-    private var lastFpsTimestamp = System.currentTimeMillis()
+    // Pacer: guarantees a minimum frame rate by repeating the last frame while the screen is static
+    private var pacerThread: HandlerThread? = null
+    private var pacerHandler: Handler? = null
+    @Volatile private var activePreset: UsbQualityPreset = UsbQualityPreset.POTATO_2000
+    @Volatile private var lastJpeg: ByteArray? = null
+    @Volatile private var lastSentMs = 0L
+    @Volatile private var lastEncodeMs = 0L
+    private var retryPending = false // touched on the frame thread only
+
+    private val sentFrames = AtomicInteger(0) // every frame delivered to viewers (real + repeated)
+    private val liveFrames = AtomicInteger(0) // frames really captured from the screen
+    private var lastStatsMs = 0L
     private var startTimeMillis = 0L
 
     companion object {
@@ -137,6 +154,11 @@ class UsbScreenShareService : Service() {
             frameHandler = Handler(looper)
         }
 
+        pacerThread = HandlerThread("UsbFramePacerThread").apply {
+            start()
+            pacerHandler = Handler(looper)
+        }
+
         // Initialize Embedded Web/MJPEG Server
         val streamServer = UsbStreamServer(port) { clientCount ->
             _shareState.value = _shareState.value.copy(connectedClients = clientCount)
@@ -172,7 +194,9 @@ class UsbScreenShareService : Service() {
             projection.registerCallback(callback, Handler(Looper.getMainLooper()))
 
             val preset = _shareState.value.qualityPreset
+            activePreset = preset
             setupVirtualDisplay(projection, preset)
+            startPacer()
 
             _shareState.value = _shareState.value.copy(
                 isStreaming = true,
@@ -203,11 +227,11 @@ class UsbScreenShareService : Service() {
         server?.streamHeight = targetHeight
 
         // Setup triple buffered ImageReader
-        val reader = ImageReader.newInstance(targetWidth, targetHeight, PixelFormat.RGBA_8888, 2)
+        val reader = ImageReader.newInstance(targetWidth, targetHeight, PixelFormat.RGBA_8888, 3)
         imageReader = reader
 
         reader.setOnImageAvailableListener({ ir ->
-            handleCapturedFrame(ir, targetWidth, targetHeight, preset.jpegQuality)
+            onImageAvailable(ir, targetWidth, targetHeight)
         }, frameHandler)
 
         virtualDisplay = projection.createVirtualDisplay(
@@ -222,11 +246,33 @@ class UsbScreenShareService : Service() {
         )
     }
 
-    private fun handleCapturedFrame(reader: ImageReader, width: Int, height: Int, jpegQuality: Int) {
+    /** Runs on the frame thread for every new screen image. Applies the max-FPS ceiling without ever losing the newest frame. */
+    private fun onImageAvailable(reader: ImageReader, width: Int, height: Int) {
+        val maxFps = activePreset.maxFps
+        if (maxFps > 0) {
+            val wait = lastEncodeMs + (1000L / maxFps) - SystemClock.elapsedRealtime()
+            if (wait > 0) {
+                // Too early: come back for the newest image once the interval has passed.
+                if (!retryPending) {
+                    retryPending = true
+                    frameHandler?.postDelayed({
+                        retryPending = false
+                        processLatestFrame(reader, width, height)
+                    }, wait)
+                }
+                return
+            }
+        }
+        processLatestFrame(reader, width, height)
+    }
+
+    private fun processLatestFrame(reader: ImageReader, width: Int, height: Int) {
         var image: Image? = null
         try {
             image = reader.acquireLatestImage()
             if (image == null) return
+
+            lastEncodeMs = SystemClock.elapsedRealtime()
 
             val planes = image.planes
             if (planes.isEmpty()) return
@@ -249,44 +295,93 @@ class UsbScreenShareService : Service() {
             val finalBitmap = if (rowPadding == 0) {
                 bmp
             } else {
+                // Reuse one bitmap + canvas (no per-frame allocation / GC churn on weak phones)
                 var cBmp = croppedBitmap
                 if (cBmp == null || cBmp.width != width || cBmp.height != height) {
                     cBmp?.recycle()
-                    cBmp = Bitmap.createBitmap(bmp, 0, 0, width, height)
+                    cBmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
                     croppedBitmap = cBmp
-                } else {
-                    cBmp = Bitmap.createBitmap(bmp, 0, 0, width, height)
+                    cropCanvas = Canvas(cBmp)
                 }
+                cropSrc.set(0, 0, width, height)
+                cropDst.set(0, 0, width, height)
+                cropCanvas?.drawBitmap(bmp, cropSrc, cropDst, null)
                 cBmp
             }
 
             baos.reset()
-            finalBitmap.compress(Bitmap.CompressFormat.JPEG, jpegQuality, baos)
+            finalBitmap.compress(Bitmap.CompressFormat.JPEG, activePreset.jpegQuality, baos)
             val jpegBytes = baos.toByteArray()
 
+            lastJpeg = jpegBytes
             server?.broadcastFrame(jpegBytes)
-
-            // FPS telemetry calculation
-            frameCount++
-            val now = System.currentTimeMillis()
-            if (now - lastFpsTimestamp >= 1000) {
-                val fps = ((frameCount * 1000L) / (now - lastFpsTimestamp)).toInt()
-                frameCount = 0
-                lastFpsTimestamp = now
-                server?.currentFps = fps
-                val elapsed = (now - startTimeMillis) / 1000L
-                val refreshedIps = getLocalIpAddresses()
-                _shareState.value = _shareState.value.copy(
-                    currentFps = fps,
-                    elapsedSeconds = elapsed,
-                    ipAddresses = refreshedIps
-                )
-            }
+            lastSentMs = SystemClock.elapsedRealtime()
+            liveFrames.incrementAndGet()
+            sentFrames.incrementAndGet()
         } catch (e: Exception) {
             Log.w(TAG, "Frame process warning: ${e.message}")
         } finally {
             try { image?.close() } catch (_: Exception) {}
         }
+    }
+
+    // ---- Pacer: min-FPS guarantee + FPS telemetry ------------------------------------------
+
+    private fun startPacer() {
+        val handler = pacerHandler ?: return
+        lastStatsMs = SystemClock.elapsedRealtime()
+        lastSentMs = lastStatsMs
+        sentFrames.set(0)
+        liveFrames.set(0)
+        handler.removeCallbacksAndMessages(null)
+        handler.post(pacerTick)
+    }
+
+    private val pacerTick = object : Runnable {
+        override fun run() {
+            val handler = pacerHandler ?: return
+            val preset = activePreset
+            var delayMs = 250L
+
+            if (preset.minFps > 0) {
+                // Send slightly above the guaranteed minimum so timer jitter can never dip below it.
+                val keepAliveMs = 1000L / (preset.minFps + 5)
+                val now = SystemClock.elapsedRealtime()
+                val sinceLast = now - lastSentMs
+                val jpeg = lastJpeg
+                if (jpeg != null && sinceLast >= keepAliveMs) {
+                    server?.broadcastFrame(jpeg)
+                    lastSentMs = now
+                    sentFrames.incrementAndGet()
+                    delayMs = keepAliveMs
+                } else if (jpeg == null) {
+                    delayMs = 20L // no frame captured yet
+                } else {
+                    delayMs = maxOf(2L, keepAliveMs - sinceLast)
+                }
+            }
+
+            publishStats()
+            handler.postDelayed(this, minOf(delayMs, 250L))
+        }
+    }
+
+    private fun publishStats() {
+        val now = SystemClock.elapsedRealtime()
+        val dt = now - lastStatsMs
+        if (dt < 1000) return
+        val fps = (sentFrames.getAndSet(0) * 1000L / dt).toInt()
+        val live = (liveFrames.getAndSet(0) * 1000L / dt).toInt()
+        lastStatsMs = now
+        server?.currentFps = fps
+        server?.liveFps = live
+        val elapsed = (System.currentTimeMillis() - startTimeMillis) / 1000L
+        _shareState.value = _shareState.value.copy(
+            currentFps = fps,
+            liveFps = live,
+            elapsedSeconds = elapsed,
+            ipAddresses = getLocalIpAddresses()
+        )
     }
 
     private fun reconfigureStream(preset: UsbQualityPreset) {
@@ -300,8 +395,12 @@ class UsbScreenShareService : Service() {
             reusableBitmap = null
             croppedBitmap?.recycle()
             croppedBitmap = null
+            cropCanvas = null
+            lastJpeg = null // old resolution frame must never be repeated
 
+            activePreset = preset
             setupVirtualDisplay(proj, preset)
+            startPacer()
             _shareState.value = _shareState.value.copy(
                 width = preset.width,
                 height = preset.height,
@@ -332,15 +431,24 @@ class UsbScreenShareService : Service() {
         server?.stop()
         server = null
 
+        pacerHandler?.removeCallbacksAndMessages(null)
+        pacerThread?.quitSafely()
+        try { pacerThread?.join(500) } catch (_: Exception) {}
+        pacerThread = null
+        pacerHandler = null
+
         frameThread?.quitSafely()
         try { frameThread?.join(500) } catch (_: Exception) {}
         frameThread = null
         frameHandler = null
+        lastJpeg = null
+        retryPending = false
 
         reusableBitmap?.recycle()
         reusableBitmap = null
         croppedBitmap?.recycle()
         croppedBitmap = null
+        cropCanvas = null
 
         _shareState.value = UsbShareState(isStreaming = false)
         stopForeground(STOP_FOREGROUND_REMOVE)

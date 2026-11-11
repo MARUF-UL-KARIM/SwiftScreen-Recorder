@@ -6,15 +6,21 @@ enum class UsbQualityPreset(
     val height: Int,
     val targetFps: Int,
     val jpegQuality: Int,
-    val description: String
+    val description: String,
+    /** Guaranteed minimum frames/sec sent to the viewer (0 = off). Static screen => last frame is repeated. */
+    val minFps: Int = 0,
+    /** Hard ceiling on frames/sec encoded & sent (0 = unlimited). */
+    val maxFps: Int = 0
 ) {
     POTATO_2000(
         title = "Potato Mode (25-70 FPS Ultra Speed)",
         width = 360,
         height = 760,
-        targetFps = 60,
+        targetFps = 70,
         jpegQuality = 42,
-        description = "High-speed 30-70 FPS stream, sub-1ms response, 0% CPU lockup for old laptops and phones"
+        description = "Steady 25-70 FPS stream (never below 25), lightweight for old laptops and phones",
+        minFps = 25,
+        maxFps = 70
     ),
     ULTRA_FAST_ZERO_LAG(
         title = "Ultra Fast (Zero-Lag 1ms)",
@@ -47,6 +53,7 @@ data class UsbShareState(
     val port: Int = 8080,
     val connectedClients: Int = 0,
     val currentFps: Int = 0,
+    val liveFps: Int = 0,
     val width: Int = 360,
     val height: Int = 760,
     val qualityPreset: UsbQualityPreset = UsbQualityPreset.POTATO_2000,

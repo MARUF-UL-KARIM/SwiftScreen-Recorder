@@ -42,9 +42,9 @@ class UsbStreamServer(
 
         fun pushFrame(frame: ByteArray) {
             // Replace pending frame: always drop stale frames if client is slow!
-            pendingFrame = frame
             synchronized(lock) {
-                lock.notify()
+                pendingFrame = frame
+                lock.notifyAll()
             }
         }
 
@@ -88,6 +88,7 @@ class UsbStreamServer(
 
     @Volatile var latestFrame: ByteArray? = null
     @Volatile var currentFps: Int = 0
+    @Volatile var liveFps: Int = 0
     @Volatile var streamWidth: Int = 360
     @Volatile var streamHeight: Int = 760
 
@@ -232,7 +233,7 @@ class UsbStreamServer(
     }
 
     private fun serveStatus(out: OutputStream) {
-        val json = """{"status":"streaming","fps":$currentFps,"width":$streamWidth,"height":$streamHeight,"clients":${activeClients.size}}"""
+        val json = """{"status":"streaming","fps":$currentFps,"live":$liveFps,"width":$streamWidth,"height":$streamHeight,"clients":${activeClients.size}}"""
         val bytes = json.toByteArray()
         val header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${bytes.size}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
         out.write(header.toByteArray())
@@ -579,7 +580,7 @@ fi
     fetch('/status')
       .then(res => res.json())
       .then(data => {
-        if (data.fps) fpsBadge.textContent = 'FPS: ' + data.fps;
+        if (data.fps) fpsBadge.textContent = 'FPS: ' + data.fps + (data.live !== undefined ? ' (live ' + data.live + ')' : '');
         if (data.width && data.height) resBadge.textContent = data.width + '×' + data.height;
       })
       .catch(() => {});

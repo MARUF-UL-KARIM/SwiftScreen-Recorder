@@ -27,23 +27,46 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var projectionManager: MediaProjectionManager
 
+    private enum class PendingCaptureType {
+        RECORDING,
+        USB_SHARE
+    }
+
+    private var pendingCaptureType: PendingCaptureType = PendingCaptureType.RECORDING
+
     // Launcher for screen capture permission via MediaProjectionManager
     private val captureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
-            val serviceIntent = Intent(this, ScreenRecorderService::class.java).apply {
-                action = ScreenRecorderService.ACTION_START
-                putExtra(ScreenRecorderService.EXTRA_RESULT_CODE, result.resultCode)
-                putExtra(ScreenRecorderService.EXTRA_RESULT_DATA, result.data)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(serviceIntent)
-            } else {
-                startService(serviceIntent)
+            when (pendingCaptureType) {
+                PendingCaptureType.RECORDING -> {
+                    val serviceIntent = Intent(this, ScreenRecorderService::class.java).apply {
+                        action = ScreenRecorderService.ACTION_START
+                        putExtra(ScreenRecorderService.EXTRA_RESULT_CODE, result.resultCode)
+                        putExtra(ScreenRecorderService.EXTRA_RESULT_DATA, result.data)
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(serviceIntent)
+                    } else {
+                        startService(serviceIntent)
+                    }
+                }
+                PendingCaptureType.USB_SHARE -> {
+                    val serviceIntent = Intent(this, com.example.service.UsbScreenShareService::class.java).apply {
+                        action = com.example.service.UsbScreenShareService.ACTION_START
+                        putExtra(com.example.service.UsbScreenShareService.EXTRA_RESULT_CODE, result.resultCode)
+                        putExtra(com.example.service.UsbScreenShareService.EXTRA_RESULT_DATA, result.data)
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(serviceIntent)
+                    } else {
+                        startService(serviceIntent)
+                    }
+                }
             }
         } else {
-            Toast.makeText(this, "Screen recording permission was not granted", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Screen capture permission was not granted", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -78,6 +101,9 @@ class MainActivity : ComponentActivity() {
                     },
                     onRequestStartCapture = {
                         initiateScreenCapture()
+                    },
+                    onRequestStartUsbShare = {
+                        initiateUsbScreenShare()
                     }
                 )
             }
@@ -85,6 +111,7 @@ class MainActivity : ComponentActivity() {
     }
 
     fun initiateScreenCapture() {
+        pendingCaptureType = PendingCaptureType.RECORDING
         val permissionsToRequest = mutableListOf<String>()
 
         // API 26/27 (Android 8/8.1) runtime storage permission verification
@@ -109,6 +136,26 @@ class MainActivity : ComponentActivity() {
                 permissionsToRequest.add(Manifest.permission.RECORD_AUDIO)
             }
         }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+
+        if (permissionsToRequest.isNotEmpty()) {
+            permissionsLauncher.launch(permissionsToRequest.toTypedArray())
+        } else {
+            val captureIntent = projectionManager.createScreenCaptureIntent()
+            captureLauncher.launch(captureIntent)
+        }
+    }
+
+    fun initiateUsbScreenShare() {
+        pendingCaptureType = PendingCaptureType.USB_SHARE
+        val permissionsToRequest = mutableListOf<String>()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)

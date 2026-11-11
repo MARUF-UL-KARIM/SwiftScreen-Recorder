@@ -27,11 +27,24 @@ class ScreenCraftApp : Application() {
 
             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             notificationManager.createNotificationChannel(channel)
+
+            val usbChannel = NotificationChannel(
+                NOTIFICATION_CHANNEL_USB_SHARE_ID,
+                "USB Screen Share",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Shows active USB screen share streaming status"
+                setShowBadge(false)
+                enableVibration(false)
+            }
+            notificationManager.createNotificationChannel(usbChannel)
         }
     }
 
     companion object {
         const val NOTIFICATION_CHANNEL_ID = "screencraft_recording_channel"
         const val NOTIFICATION_ID = 1001
+        const val NOTIFICATION_CHANNEL_USB_SHARE_ID = "screencraft_usb_share_channel"
+        const val NOTIFICATION_USB_SHARE_ID = 2001
     }
 }

@@ -15,6 +15,8 @@
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
         android:name=".ScreenCraftApp"
@@ -58,6 +60,13 @@
         <!-- Service for MediaProjection Permissions and Frame Buffering -->
         <service
             android:name=".service.MediaProjectionFrameService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+        <!-- Foreground Service for Real-time USB Screen Share to PC Browser -->
+        <service
+            android:name=".service.UsbScreenShareService"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />

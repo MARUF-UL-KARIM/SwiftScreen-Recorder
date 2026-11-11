@@ -86,11 +86,15 @@ import com.example.ui.theme.StudioBlue
 import com.example.ui.theme.StudioRed
 import kotlinx.coroutines.launch
 
+import androidx.compose.material.icons.filled.ScreenShare
+import com.example.service.UsbScreenShareService
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
     onSetExcludeFromRecents: (Boolean) -> Unit = {},
-    onRequestStartCapture: () -> Unit = {}
+    onRequestStartCapture: () -> Unit = {},
+    onRequestStartUsbShare: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -140,6 +144,13 @@ fun MainScreen(
             this.action = action
         }
         context.startService(intent)
+    }
+
+    fun stopUsbShareFlow() {
+        val stopIntent = Intent(context, UsbScreenShareService::class.java).apply {
+            action = UsbScreenShareService.ACTION_STOP
+        }
+        context.startService(stopIntent)
     }
 
     Scaffold(
@@ -206,6 +217,19 @@ fun MainScreen(
                 NavigationBarItem(
                     selected = selectedTabIndex == 1,
                     onClick = { selectedTabIndex = 1 },
+                    icon = { Icon(Icons.Default.ScreenShare, contentDescription = "USB Share") },
+                    label = { Text("USB Share") },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = StudioBlue,
+                        selectedTextColor = StudioBlue,
+                        indicatorColor = StudioBlue.copy(alpha = 0.15f)
+                    ),
+                    modifier = Modifier.testTag("tab_usb_share")
+                )
+
+                NavigationBarItem(
+                    selected = selectedTabIndex == 2,
+                    onClick = { selectedTabIndex = 2 },
                     icon = { Icon(Icons.Default.Settings, contentDescription = "Settings") },
                     label = { Text("Settings") },
                     colors = NavigationBarItemDefaults.colors(
@@ -318,27 +342,36 @@ fun MainScreen(
 
             // Main Tab Content
             Box(modifier = Modifier.weight(1f)) {
-                if (selectedTabIndex == 0) {
-                    RecordsScreen(
-                        videos = videos,
-                        onDeleteVideo = { video ->
-                            coroutineScope.launch {
-                                videoRepository.deleteVideo(video)
+                when (selectedTabIndex) {
+                    0 -> {
+                        RecordsScreen(
+                            videos = videos,
+                            onDeleteVideo = { video ->
+                                coroutineScope.launch {
+                                    videoRepository.deleteVideo(video)
+                                }
+                            },
+                            onRenameVideo = { video, newName ->
+                                coroutineScope.launch {
+                                    videoRepository.renameVideo(video, newName)
+                                }
                             }
-                        },
-                        onRenameVideo = { video, newName ->
-                            coroutineScope.launch {
-                                videoRepository.renameVideo(video, newName)
+                        )
+                    }
+                    1 -> {
+                        UsbScreenShareScreen(
+                            onRequestStartShare = onRequestStartUsbShare,
+                            onStopShare = { stopUsbShareFlow() }
+                        )
+                    }
+                    else -> {
+                        SettingsScreen(
+                            settings = settings,
+                            onSettingsChanged = { newSettings ->
+                                settingsRepository.updateSettings(newSettings)
                             }
-                        }
-                    )
-                } else {
-                    SettingsScreen(
-                        settings = settings,
-                        onSettingsChanged = { newSettings ->
-                            settingsRepository.updateSettings(newSettings)
-                        }
-                    )
+                        )
+                    }
                 }
             }
         }
